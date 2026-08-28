@@ -1,8 +1,12 @@
 --[[
   quarry.lua — CC: Tweaked mining turtle quarry script
   ------------------------------------------------------
-  Usage:  quarry <width> <length>
-  Example: quarry 8 8
+  Usage:
+    quarry <width> <length> [maxDepth] [startDepth]
+    quarry 8 8              → 8x8, no depth cap, start from the surface
+    quarry 8 8 400          → 8x8, stop after 400 blocks if no bedrock found
+    quarry 8 8 400 20       → same, but skip straight down 20 blocks first
+                               (e.g. you already manually cleared that far)
 
   SETUP BEFORE RUNNING:
    - Place the turtle where you want it to start (this is "home").
@@ -32,9 +36,11 @@ local args = { ... }
 local WIDTH  = tonumber(args[1]) or 8
 local LENGTH = tonumber(args[2]) or 8
 local MAX_DEPTH = tonumber(args[3]) or 400  -- hard cap on blocks dug downward, as a void backstop
+local START_DEPTH = math.abs(tonumber(args[4]) or 0)  -- skip straight down this many blocks before mining begins
 local FUEL_SAFETY_MARGIN = 25   -- extra fuel buffer on top of the trip home
 local MIN_SAFE_WORLD_Y = -58    -- if GPS is available: stop before reaching the real bedrock/void zone
 local LOG_FILE = "quarry_log.txt"
+local STATE_FILE = "quarry_state.txt"
 
 -- ===================== STATE =====================
 -- facing: 0 = +Z (forward, into the quarry), 1 = +X (right),
@@ -44,6 +50,33 @@ local posX, posY, posZ = 0, 0, 0   -- posY is <=0 (depth), 0 = start height
 local hasGPS = false
 local worldX, worldY, worldZ = nil, nil, nil    -- real-world coords, if GPS is available
 local facingVectors = nil                        -- [0..3] -> {dx, dz} in world space
+local completedDepth = 0    -- deepest fully-finished layer boundary (<=0)
+
+-- load any saved progress from a previous, interrupted run. This runs
+-- before logging exists, so any message is queued and printed later.
+local resumed = false
+local resumeNotice = nil
+local resumedStatus = nil
+do
+    if fs.exists(STATE_FILE) then
+        local f = fs.open(STATE_FILE, "r")
+        local raw = f.readAll()
+        f.close()
+        local ok, saved = pcall(textutils.unserialize, raw)
+        if ok and type(saved) == "table" and saved.x ~= nil then
+            posX, posY, posZ, facing = saved.x, saved.y, saved.z, saved.facing or 0
+            completedDepth = saved.completedDepth or 0
+            resumedStatus = saved.status
+            resumed = true
+            resumeNotice = "Resuming saved progress: last known position x=" .. posX ..
+                " y=" .. posY .. " z=" .. posZ .. ", completed down to depth " .. math.abs(completedDepth) .. "."
+            if saved.width and saved.length and (saved.width ~= WIDTH or saved.length ~= LENGTH) then
+                resumeNotice = resumeNotice .. " NOTE: saved run used " .. saved.width .. "x" .. saved.length ..
+                    ", this run is " .. WIDTH .. "x" .. LENGTH .. " — footprint changed."
+            end
+        end
+    end
+end
 
 -- ===================== LOGGING / STATUS PINGS =====================
 local modemOpen = false
@@ -64,6 +97,19 @@ local function broadcastStatus(status, detail)
     }, PROTOCOL)
 end
 
+local function saveState()
+    local f = fs.open(STATE_FILE, "w")
+    if f then
+        f.write(textutils.serialize({
+            x = posX, y = posY, z = posZ, facing = facing,
+            completedDepth = completedDepth,
+            width = WIDTH, length = LENGTH,
+            status = currentStatus,
+        }))
+        f.close()
+    end
+end
+
 local function log(msg)
     local line = "[" .. os.date("%H:%M:%S") .. "] " .. msg
     local f = fs.open(LOG_FILE, "a")
@@ -78,7 +124,10 @@ end
 local function setStatus(s)
     currentStatus = s
     broadcastStatus(s, nil)
+    saveState()
 end
+
+if resumeNotice then log(resumeNotice) end
 
 -- find and open a wireless modem, on any side (equipped or placed nearby)
 do
@@ -259,6 +308,7 @@ local function safeForward()
         worldX = worldX + facingVectors[facing].dx
         worldZ = worldZ + facingVectors[facing].dz
     end
+    saveState()
     return true
 end
 
@@ -278,6 +328,7 @@ local function safeUp()
     end
     posY = posY + 1
     if hasGPS then worldY = worldY + 1 end
+    saveState()
     return true
 end
 
@@ -327,6 +378,7 @@ local function safeDown()
     end
     posY = posY - 1
     if hasGPS then worldY = worldY - 1 end
+    saveState()
     return true
 end
 
@@ -507,6 +559,11 @@ end
 
 -- ===================== MAIN =====================
 local function runQuarry()
+    if resumedStatus == "complete" then
+        log("Previous run already completed. Nothing to resume — delete quarry_state.txt to force a fresh run.")
+        return
+    end
+
     setStatus("mining")
     log("Starting quarry: " .. WIDTH .. " x " .. LENGTH .. " down to bedrock.")
     tryRefuelFromInventory()
@@ -515,6 +572,40 @@ local function runQuarry()
         setStatus("error_no_fuel")
         log("ERROR: Not enough fuel to safely start. Add fuel and rerun.")
         return
+    end
+
+    if resumed then
+        log("Returning home first to reset to a known position, then redescending to depth " .. math.abs(completedDepth) .. " to resume.")
+        goTo(0, 0, 0)
+        turnTo(0)
+        unloadAtHome()
+        goTo(0, completedDepth, 0)
+        turnTo(0)
+    elseif START_DEPTH > 0 then
+        log("Bypass requested: descending " .. START_DEPTH .. " blocks straight down before mining begins.")
+        setStatus("descending_to_start")
+        local bypassStopped, bypassReason = false, nil
+        for _ = 1, START_DEPTH do
+            local ok, reason = safeDown()
+            if not ok then
+                bypassStopped, bypassReason = true, reason
+                break
+            end
+        end
+        if bypassStopped then
+            log("Hit " .. tostring(bypassReason) .. " at depth " .. math.abs(posY) ..
+                " while descending to the bypass start depth — nothing to mine below. Heading home.")
+            setStatus("bypass_stopped_early")
+            goTo(0, 0, 0)
+            turnTo(0)
+            unloadAtHome()
+            setStatus("complete")
+            if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+            return
+        end
+        completedDepth = posY
+        saveState()
+        log("Reached start depth " .. math.abs(posY) .. ". Beginning normal quarry mining.")
     end
 
     local hitBedrock = false
@@ -541,6 +632,11 @@ local function runQuarry()
                 break
             end
         end
+
+        if not hitBedrock then
+            completedDepth = posY
+            saveState()
+        end
     end
 
     setStatus("returning_home_complete")
@@ -548,6 +644,7 @@ local function runQuarry()
     turnTo(0)
     unloadAtHome()
     setStatus("complete")
+    if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
     log("Quarry complete. Turtle is home.")
 end
 
