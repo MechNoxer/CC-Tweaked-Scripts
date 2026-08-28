@@ -50,6 +50,7 @@ local facingVectors = nil                        -- [0..3] -> {dx, dz} in world 
 local modemOpen = false
 local TURTLE_LABEL = os.getComputerLabel() or ("Turtle" .. os.getComputerID())
 local PROTOCOL = "quarry_status"
+local PING_PROTOCOL = "quarry_ping"
 local currentStatus = "starting"
 
 local function broadcastStatus(status, detail)
@@ -560,22 +561,50 @@ local function runQuarry()
     log("Quarry complete. Turtle is home.")
 end
 
+-- ===================== PING LISTENER (runs alongside mining) =====================
+local function pingListener()
+    while true do
+        local senderId, message = rednet.receive(PING_PROTOCOL)
+        if type(message) == "table" and message.type == "ping" then
+            rednet.send(senderId, {
+                type = "pong",
+                label = TURTLE_LABEL,
+                status = currentStatus,
+                x = posX, y = posY, z = posZ,
+                wx = worldX, wy = worldY, wz = worldZ,
+                fuel = turtle.getFuelLevel(),
+                sentAt = message.sentAt,
+            }, PING_PROTOCOL)
+        end
+    end
+end
+
 -- top-level error guard: on any unexpected error, log it, try to get home,
 -- and stop cleanly instead of crashing silently.
-local ok, err = pcall(runQuarry)
-if not ok then
-    setStatus("error")
-    log("UNEXPECTED ERROR: " .. tostring(err))
-    local homeOk = pcall(function()
-        goTo(0, 0, 0)
-        turnTo(0)
-    end)
-    if homeOk then
-        setStatus("home_after_error")
-        log("Returned home after error.")
-    else
-        setStatus("stuck_after_error")
-        log("Could NOT return home after error — manual recovery needed. Last known position: x="
-            .. posX .. " y=" .. posY .. " z=" .. posZ .. " facing=" .. facing)
+local function runQuarryGuarded()
+    local ok, err = pcall(runQuarry)
+    if not ok then
+        setStatus("error")
+        log("UNEXPECTED ERROR: " .. tostring(err))
+        local homeOk = pcall(function()
+            goTo(0, 0, 0)
+            turnTo(0)
+        end)
+        if homeOk then
+            setStatus("home_after_error")
+            log("Returned home after error.")
+        else
+            setStatus("stuck_after_error")
+            log("Could NOT return home after error — manual recovery needed. Last known position: x="
+                .. posX .. " y=" .. posY .. " z=" .. posZ .. " facing=" .. facing)
+        end
     end
+end
+
+if modemOpen then
+    -- run the quarry and the ping listener side by side; ends when the
+    -- quarry run finishes (the listener alone never returns on its own)
+    parallel.waitForAny(runQuarryGuarded, pingListener)
+else
+    runQuarryGuarded()
 end
