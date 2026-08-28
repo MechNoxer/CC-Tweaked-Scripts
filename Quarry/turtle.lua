@@ -33,7 +33,7 @@ local WIDTH  = tonumber(args[1]) or 8
 local LENGTH = tonumber(args[2]) or 8
 local MAX_DEPTH = tonumber(args[3]) or 400  -- hard cap on blocks dug downward, as a void backstop
 local FUEL_SAFETY_MARGIN = 25   -- extra fuel buffer on top of the trip home
-local VOID_SAFETY_BLOCKS = 3    -- consecutive "nothing below" reads before treating it as a void/chasm
+local MIN_SAFE_WORLD_Y = -58    -- if GPS is available: stop before reaching the real bedrock/void zone
 local LOG_FILE = "quarry_log.txt"
 
 -- ===================== STATE =====================
@@ -41,7 +41,6 @@ local LOG_FILE = "quarry_log.txt"
 --         2 = -Z (back, toward the chest), 3 = -X (left)
 local facing = 0
 local posX, posY, posZ = 0, 0, 0   -- posY is <=0 (depth), 0 = start height
-local consecutiveOpenBelow = 0     -- tracks unexpected open air below (cave/ravine/void gap)
 local hasGPS = false
 local worldX, worldY, worldZ = nil, nil, nil    -- real-world coords, if GPS is available
 local facingVectors = nil                        -- [0..3] -> {dx, dz} in world space
@@ -282,8 +281,8 @@ local function safeUp()
     return true
 end
 
--- returns true if it moved down, false if it hit bedrock/unbreakable block
--- or an unsafe open drop (cave/ravine/void gap)
+-- returns true if it moved down, false if it hit bedrock/unbreakable block,
+-- the configured max depth, or the real-world bedrock/void zone (GPS only)
 local function safeDown()
     ensureFuel()
 
@@ -291,25 +290,15 @@ local function safeDown()
         return false, "max_depth_reached"
     end
 
-    if not turtle.detectDown() then
-        -- nothing there at all — normal for a shallow cave pocket, but a
-        -- run of these in a row means an open chasm or a gap in the
-        -- bedrock leading to the void. Don't just step into it.
-        consecutiveOpenBelow = consecutiveOpenBelow + 1
-        if consecutiveOpenBelow >= VOID_SAFETY_BLOCKS then
-            setStatus("void_hazard")
-            log("CRITICAL: " .. consecutiveOpenBelow .. " consecutive open blocks below with no floor — likely a chasm or void gap. Placing a safety block and heading home.")
-            local slot = findFillerSlot()
-            if slot then
-                turtle.select(slot)
-                turtle.placeDown()
-                turtle.select(1)
-            end
-            return false, "void_hazard"
-        end
-    else
-        consecutiveOpenBelow = 0
+    if hasGPS and worldY <= MIN_SAFE_WORLD_Y then
+        return false, "near_world_bottom"
     end
+
+    -- note: no "open air below" abort here. Turtles move exactly one
+    -- block per down command and take no fall damage, so a cave or
+    -- ravine of any height is safe to descend through one block at a
+    -- time — it just isn't excavated as ore/loot, only passed through.
+    -- The real hazard is the world's actual bottom, handled above.
 
     local tries = 0
     while turtle.detectDown() do
@@ -538,8 +527,9 @@ local function runQuarry()
                 if reason == "bedrock_or_unbreakable" then
                     setStatus("bedrock_reached")
                     log("Bedrock (or unbreakable block) reached at depth " .. math.abs(posY) .. ". Heading home.")
-                elseif reason == "void_hazard" then
-                    log("Stopped at depth " .. math.abs(posY) .. " due to an open drop below (possible chasm/void gap). Heading home.")
+                elseif reason == "near_world_bottom" then
+                    setStatus("near_world_bottom")
+                    log("Reached the real-world bedrock/void zone (world Y " .. tostring(worldY) .. "). Stopping here for safety. Heading home.")
                 elseif reason == "max_depth_reached" then
                     setStatus("max_depth_reached")
                     log("Hit the configured max depth (" .. MAX_DEPTH .. ") without finding bedrock. Heading home.")
