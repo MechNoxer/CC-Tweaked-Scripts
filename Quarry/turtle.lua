@@ -37,7 +37,7 @@ local WIDTH  = tonumber(args[1]) or 8
 local LENGTH = tonumber(args[2]) or 8
 local MAX_DEPTH = tonumber(args[3]) or 400  -- hard cap on blocks dug downward, as a void backstop
 local START_DEPTH = math.abs(tonumber(args[4]) or 0)  -- skip straight down this many blocks before mining begins
-local FUEL_SAFETY_MARGIN = 25   -- extra fuel buffer on top of the trip home
+local FUEL_SAFETY_MARGIN = 40   -- flat extra fuel buffer on top of the trip home
 local MIN_SAFE_WORLD_Y = -58    -- if GPS is available: stop before reaching the real bedrock/void zone
 local LOG_FILE = "quarry_log.txt"
 local STATE_FILE = "quarry_state.txt"
@@ -192,11 +192,13 @@ end
 local function turnLeft()
     turtle.turnLeft()
     facing = (facing - 1) % 4
+    saveState() -- persist facing immediately, don't wait for a move to succeed
 end
 
 local function turnRight()
     turtle.turnRight()
     facing = (facing + 1) % 4
+    saveState()
 end
 
 local function turnTo(target)
@@ -210,6 +212,7 @@ end
 -- forward declare so movement fns can call fuel/inventory checks
 local ensureFuel
 local ensureInventorySpace
+local unloadAtHome
 
 -- ===================== HAZARDS (lava / water) =====================
 local HAZARDS = {
@@ -439,20 +442,23 @@ local function distanceHome()
 end
 
 -- called before movements; if fuel is too low to safely get home,
--- bail out and return home now.
+-- bail out and return home now. The buffer scales with distance too,
+-- since a flat margin gives thinner and thinner protection the deeper
+-- (and further from home) the turtle gets.
 ensureFuel = function()
     local level = turtle.getFuelLevel()
     if level == "unlimited" then return end
-    local needed = distanceHome() + FUEL_SAFETY_MARGIN
+    local dist = distanceHome()
+    local buffer = math.max(FUEL_SAFETY_MARGIN, math.ceil(dist * 0.15))
+    local needed = dist + buffer
     if level <= needed then
         tryRefuelFromInventory()
         level = turtle.getFuelLevel()
         if level ~= "unlimited" and level <= needed then
             setStatus("returning_low_fuel")
-            log("LOW FUEL (" .. tostring(level) .. "). Returning home.")
-            goTo(0, 0, 0)
-            turnTo(0)
-            log("Stopped at home due to low fuel. Please refuel and rerun.")
+            log("LOW FUEL (" .. tostring(level) .. "). Returning home to unload before stopping.")
+            unloadAtHome(false)
+            log("Stopped at home due to low fuel, inventory unloaded. Please add fuel and rerun.")
             error("LOW_FUEL_ABORT")
         end
     end
@@ -466,7 +472,13 @@ local function hasEmptySlot()
     return false
 end
 
-local function unloadAtHome()
+-- unloads into the chest. When returnAfter is true (default), it goes
+-- back to wherever it was called from afterward — used for normal
+-- inventory-full stops mid-mining. Pass false when the run is ending
+-- (low fuel / bedrock / complete) so it stays home instead of burning
+-- more fuel travelling back down.
+unloadAtHome = function(returnAfter)
+    if returnAfter == nil then returnAfter = true end
     local savedX, savedY, savedZ, savedFacing = posX, posY, posZ, facing
     setStatus("unloading")
     log("Returning home to unload inventory.")
@@ -492,15 +504,19 @@ local function unloadAtHome()
         log("WARNING: chest appears full, some items kept in inventory.")
     end
     log("Unloaded " .. dropped .. " stack(s), kept " .. keptFuel .. " fuel stack(s).")
-    turnTo(savedFacing)
-    goTo(savedX, savedY, savedZ)
-    turnTo(savedFacing)
-    setStatus("mining")
+    if returnAfter then
+        turnTo(savedFacing)
+        goTo(savedX, savedY, savedZ)
+        turnTo(savedFacing)
+        setStatus("mining")
+    else
+        turnTo(0)
+    end
 end
 
 ensureInventorySpace = function()
     if not hasEmptySlot() then
-        unloadAtHome()
+        unloadAtHome(true)
     end
 end
 
@@ -575,10 +591,17 @@ local function runQuarry()
     end
 
     if resumed then
-        log("Returning home first to reset to a known position, then redescending to depth " .. math.abs(completedDepth) .. " to resume.")
-        goTo(0, 0, 0)
-        turnTo(0)
-        unloadAtHome()
+        local tripCost = distanceHome() + math.abs(completedDepth)
+        local level = turtle.getFuelLevel()
+        if level ~= "unlimited" and level < (tripCost + FUEL_SAFETY_MARGIN) then
+            setStatus("error_no_fuel")
+            log("ERROR: Not enough fuel to resume safely — need roughly " .. (tripCost + FUEL_SAFETY_MARGIN) ..
+                " (trip home + back down to depth " .. math.abs(completedDepth) .. " + margin), have " .. level ..
+                ". Add more fuel and rerun.")
+            return
+        end
+        log("Resuming: returning home first, then redescending to depth " .. math.abs(completedDepth) .. ".")
+        unloadAtHome(false)
         goTo(0, completedDepth, 0)
         turnTo(0)
     elseif START_DEPTH > 0 then
@@ -596,9 +619,7 @@ local function runQuarry()
             log("Hit " .. tostring(bypassReason) .. " at depth " .. math.abs(posY) ..
                 " while descending to the bypass start depth — nothing to mine below. Heading home.")
             setStatus("bypass_stopped_early")
-            goTo(0, 0, 0)
-            turnTo(0)
-            unloadAtHome()
+            unloadAtHome(false)
             setStatus("complete")
             if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
             return
@@ -640,9 +661,7 @@ local function runQuarry()
     end
 
     setStatus("returning_home_complete")
-    goTo(0, 0, 0)
-    turnTo(0)
-    unloadAtHome()
+    unloadAtHome(false)
     setStatus("complete")
     if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
     log("Quarry complete. Turtle is home.")
@@ -666,20 +685,19 @@ local function pingListener()
     end
 end
 
--- top-level error guard: on any unexpected error, log it, try to get home,
--- and stop cleanly instead of crashing silently.
+-- top-level error guard: on any unexpected error, log it, try to get home
+-- and unload before stopping cleanly instead of crashing silently.
 local function runQuarryGuarded()
     local ok, err = pcall(runQuarry)
     if not ok then
         setStatus("error")
         log("UNEXPECTED ERROR: " .. tostring(err))
         local homeOk = pcall(function()
-            goTo(0, 0, 0)
-            turnTo(0)
+            unloadAtHome(false)
         end)
         if homeOk then
             setStatus("home_after_error")
-            log("Returned home after error.")
+            log("Returned home and unloaded after error.")
         else
             setStatus("stuck_after_error")
             log("Could NOT return home after error — manual recovery needed. Last known position: x="
