@@ -97,26 +97,60 @@ local function broadcastStatus(status, detail)
     }, PROTOCOL)
 end
 
+local MAX_LOG_BYTES = 20000  -- trim the log instead of growing forever
+
 local function saveState()
-    local f = fs.open(STATE_FILE, "w")
-    if f then
-        f.write(textutils.serialize({
-            x = posX, y = posY, z = posZ, facing = facing,
-            completedDepth = completedDepth,
-            width = WIDTH, length = LENGTH,
-            status = currentStatus,
-        }))
+    -- never let a full disk (or any write failure) crash the run
+    pcall(function()
+        local f = fs.open(STATE_FILE, "w")
+        if f then
+            f.write(textutils.serialize({
+                x = posX, y = posY, z = posZ, facing = facing,
+                completedDepth = completedDepth,
+                width = WIDTH, length = LENGTH,
+                status = currentStatus,
+            }))
+            f.close()
+        end
+    end)
+end
+
+-- keeps only the most recent lines once the log gets too big, so it can
+-- never grow without bound and fill the turtle's storage
+local function trimLogIfNeeded()
+    if not fs.exists(LOG_FILE) then return end
+    local okSize, size = pcall(fs.getSize, LOG_FILE)
+    if not okSize or size < MAX_LOG_BYTES then return end
+    pcall(function()
+        local f = fs.open(LOG_FILE, "r")
+        local lines = {}
+        local l = f.readLine()
+        while l do
+            table.insert(lines, l)
+            l = f.readLine()
+        end
         f.close()
-    end
+        local keep = math.floor(#lines / 2)
+        local startIdx = #lines - keep + 1
+        local out = fs.open(LOG_FILE, "w")
+        out.writeLine("[log trimmed here — older entries discarded to save space]")
+        for i = startIdx, #lines do
+            out.writeLine(lines[i])
+        end
+        out.close()
+    end)
 end
 
 local function log(msg)
     local line = "[" .. os.date("%H:%M:%S") .. "] " .. msg
-    local f = fs.open(LOG_FILE, "a")
-    if f then
-        f.writeLine(line)
-        f.close()
-    end
+    trimLogIfNeeded()
+    pcall(function()
+        local f = fs.open(LOG_FILE, "a")
+        if f then
+            f.writeLine(line)
+            f.close()
+        end
+    end)
     print(line)
     broadcastStatus(currentStatus, msg)
 end
