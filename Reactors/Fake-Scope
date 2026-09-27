@@ -1,0 +1,262 @@
+-- scope.lua - fake oscilloscope / signal scanner for CC:Tweaked
+-- Built for BASIC monitors (greyscale, no touch). Works 2x1 or 1x2.
+-- Cycles through: SEARCHING -> LOCKING -> ACQUIRED -> SIGNAL LOST
+-- Keys on the computer: N = lock onto a new signal now.
+
+local FRAME = 0.1   -- 10 fps
+
+local mon = peripheral.find("monitor")
+if not mon then error("No monitor attached", 0) end
+
+local WHITE, LGRAY, GRAY, BLACK = "0", "8", "7", "f"
+local PRI = { [BLACK] = 0, [GRAY] = 1, [LGRAY] = 2, [WHITE] = 3 }
+local BITS = { 1, 2, 4, 8, 16 }
+
+local W, H, vertical, headerRows, footerRows, plotTop, plotRows, PW, PH
+
+local function setup()
+  mon.setTextScale(0.5)
+  W, H = mon.getSize()
+  vertical = H > W
+  headerRows = vertical and 2 or 1
+  footerRows = vertical and 2 or 1
+  plotTop = headerRows + 1
+  plotRows = H - headerRows - footerRows
+  PW, PH = W * 2, plotRows * 3
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+end
+
+-- ---------- waveforms ----------
+local TAU = math.pi * 2
+local WAVES = {
+  SIN = function(x) return math.sin(TAU * x) end,
+  SQR = function(x) return (x % 1) < 0.5 and 1 or -1 end,
+  TRI = function(x) return 4 * math.abs((x % 1) - 0.5) - 1 end,
+  SAW = function(x) return 2 * (x % 1) - 1 end,
+  PLS = function(x) return (x % 1) < 0.15 and 1 or -0.35 end,
+  AM  = function(x) return math.sin(TAU * x) * (0.55 + 0.45 * math.sin(TAU * x * 0.25)) end,
+}
+local WAVE_NAMES = { "SIN", "SQR", "TRI", "SAW", "PLS", "AM" }
+
+-- ---------- signal state ----------
+local sig = {}
+local state, stateTime, stateDur = "search", 0, 6
+local lastTrace
+
+local function newSignal()
+  local wide = PW >= 50
+  sig.name = WAVE_NAMES[math.random(#WAVE_NAMES)]
+  sig.freq = 10 ^ (1 + math.random() * 5)            -- 10 Hz .. 1 MHz
+  if sig.name == "AM" then
+    sig.cycles = wide and (6 + math.random() * 4) or (4 + math.random() * 2)
+  else
+    sig.cycles = wide and (1.5 + math.random() * 3.5) or (1.2 + math.random() * 1.8)
+  end
+  sig.tdiv = sig.cycles / sig.freq / 10               -- 10 horizontal divisions
+  sig.amp = 0.35 + math.random() * 0.55
+end
+
+local function setState(s, dur)
+  state, stateTime, stateDur = s, 0, dur
+end
+
+local function update()
+  stateTime = stateTime + FRAME
+  if stateTime >= stateDur then
+    if state == "search" then newSignal(); setState("lock", 1.5)
+    elseif state == "lock" then setState("acq", 10 + math.random() * 15)
+    elseif state == "acq" then setState("lost", 1.2)
+    else setState("search", 5 + math.random() * 7) end
+  end
+  if state == "acq" then  -- slow frequency drift
+    sig.freq = sig.freq * (1 + (math.random() - 0.5) * 0.004)
+    sig.cycles = sig.freq * sig.tdiv * 10
+  end
+end
+
+local function buildTrace()
+  local f, cycles, amp, noise, phase
+  local k = stateTime / stateDur
+  if state == "search" then
+    f, cycles, amp, noise, phase = WAVES.SIN, 1 + math.random() * 6, 0.15, 0.3, math.random()
+  elseif state == "lock" then
+    f, cycles = WAVES[sig.name], sig.cycles
+    amp = sig.amp * (0.3 + 0.7 * k)
+    noise = 0.3 * (1 - k) + 0.03
+    phase = (math.random() - 0.5) * (1 - k) * 0.8
+  elseif state == "acq" then
+    f, cycles, amp, noise = WAVES[sig.name], sig.cycles, sig.amp, 0.03
+    phase = (math.random() - 0.5) * 0.01
+  else -- lost
+    f, cycles = WAVES[sig.name], sig.cycles
+    amp = sig.amp * (1 - k)
+    noise = 0.03 + 0.3 * k
+    phase = math.random() * k
+  end
+  local t = {}
+  for i = 1, PW do
+    local x = (i - 1) / (PW - 1) * cycles + phase
+    t[i] = math.max(-1, math.min(1, f(x) * amp + (math.random() * 2 - 1) * noise))
+  end
+  return t
+end
+
+-- ---------- formatting ----------
+local function fmtFreq(f)
+  if f >= 1e6 then return string.format("%.2fMHz", f / 1e6)
+  elseif f >= 1e3 then return string.format("%.1fkHz", f / 1e3)
+  else return string.format("%.1fHz", f) end
+end
+
+local function fmtTime(t)
+  if t >= 1 then return string.format("%.2fs", t)
+  elseif t >= 1e-3 then return string.format("%.1fms", t * 1e3)
+  elseif t >= 1e-6 then return string.format("%.1fus", t * 1e6)
+  else return string.format("%.0fns", t * 1e9) end
+end
+
+-- ---------- drawing ----------
+local function textRow(y, left, right, fg, bg)
+  right = right or ""
+  local gap = W - #left - #right
+  local s = gap >= 1 and (left .. (" "):rep(gap) .. right) or left
+  s = (s .. (" "):rep(W)):sub(1, W)
+  mon.setCursorPos(1, y)
+  mon.setTextColor(fg)
+  mon.setBackgroundColor(bg)
+  mon.write(s)
+end
+
+local function writeRight(y, s, fg, bg)
+  mon.setCursorPos(math.max(1, W - #s + 1), y)
+  mon.setTextColor(fg)
+  mon.setBackgroundColor(bg)
+  mon.write(s)
+end
+
+local function renderPlot(trace)
+  local px = {}
+  local function set(x, y, c)
+    if x < 1 or x > PW or y < 1 or y > PH then return end
+    local k = (y - 1) * PW + x
+    local o = px[k]
+    if not o or PRI[c] > PRI[o] then px[k] = c end
+  end
+
+  -- graticule: 10 x 8 divisions, solid-dotted centre axes
+  for d = 0, 10 do
+    local x = math.floor(d / 10 * (PW - 1) + 0.5) + 1
+    local stepY = d == 5 and 1 or 2
+    for y = 1, PH, stepY do set(x, y, GRAY) end
+  end
+  for d = 0, 8 do
+    local y = math.floor(d / 8 * (PH - 1) + 0.5) + 1
+    local stepX = d == 4 and 1 or 2
+    for x = 1, PW, stepX do set(x, y, GRAY) end
+  end
+
+  local center, half = (PH + 1) / 2, (PH - 1) / 2
+  local function drawTrace(t, c)
+    local prev
+    for i, s in ipairs(t) do
+      local y = math.max(1, math.min(PH, math.floor(center - s * half + 0.5)))
+      local lo, hi = y, y
+      if prev then lo, hi = math.min(prev, y), math.max(prev, y) end
+      for yy = lo, hi do set(i, yy, c) end
+      prev = y
+    end
+  end
+  if lastTrace and #lastTrace == PW then drawTrace(lastTrace, LGRAY) end -- phosphor afterglow
+  drawTrace(trace, WHITE)
+
+  for row = 1, plotRows do
+    local text, fg, bg = {}, {}, {}
+    local y0 = (row - 1) * 3
+    for col = 1, W do
+      local x0 = (col - 1) * 2
+      local p = {
+        px[y0 * PW + x0 + 1], px[y0 * PW + x0 + 2],
+        px[(y0 + 1) * PW + x0 + 1], px[(y0 + 1) * PW + x0 + 2],
+        px[(y0 + 2) * PW + x0 + 1], px[(y0 + 2) * PW + x0 + 2],
+      }
+      local c = BLACK
+      for i = 1, 6 do
+        if p[i] and PRI[p[i]] > PRI[c] then c = p[i] end
+      end
+      local inv = p[6] ~= nil
+      local n = 128
+      for i = 1, 5 do
+        local on = p[i] ~= nil
+        if inv then on = not on end
+        if on then n = n + BITS[i] end
+      end
+      text[col] = string.char(n)
+      if inv then fg[col], bg[col] = BLACK, c else fg[col], bg[col] = c, BLACK end
+    end
+    mon.setCursorPos(1, plotTop + row - 1)
+    mon.blit(table.concat(text), table.concat(fg), table.concat(bg))
+  end
+end
+
+local function draw()
+  local trace = buildTrace()
+  local blink = (os.clock() * 4) % 2 < 1
+  local known = state ~= "search"
+
+  local long, short, sfg, sbg
+  if state == "search" then
+    long, short, sfg, sbg = "SEARCHING", "SEARCH", colors.lightGray, colors.black
+  elseif state == "lock" then
+    long, short, sfg, sbg = "LOCKING", "LOCK", colors.white, colors.gray
+  elseif state == "acq" then
+    long, short = "ACQUIRED", "ACQ"
+    if stateTime < 2.5 and blink then sfg, sbg = colors.white, colors.black
+    else sfg, sbg = colors.black, colors.white end
+  else
+    long, short = "SIGNAL LOST", "LOST"
+    sfg, sbg = blink and colors.white or colors.gray, colors.black
+  end
+
+  local wave = known and sig.name or "---"
+  local freq = known and fmtFreq(sig.freq) or "---"
+  local vpp = known and string.format("%.2fV", sig.amp * 8) or "---"
+  local tdiv = known and (fmtTime(sig.tdiv) .. "/DIV") or "AUTO"
+
+  if vertical then
+    textRow(1, " CH1", nil, colors.black, colors.lightGray)
+    writeRight(1, " " .. short .. " ", sfg, sbg)
+    textRow(2, " " .. wave .. " " .. freq, nil, colors.white, colors.black)
+    textRow(H - 1, " VPP " .. vpp, nil, colors.white, colors.black)
+    textRow(H, " " .. tdiv, nil, colors.lightGray, colors.black)
+  else
+    textRow(1, " CH1 " .. wave .. " " .. freq, nil, colors.black, colors.lightGray)
+    writeRight(1, " " .. long .. " ", sfg, sbg)
+    textRow(H, " 1V/DIV " .. tdiv, "VPP " .. vpp .. " ", colors.lightGray, colors.black)
+  end
+
+  renderPlot(trace)
+  lastTrace = trace
+end
+
+-- ---------- main ----------
+setup()
+term.clear()
+term.setCursorPos(1, 1)
+print("Oscilloscope running on monitor.")
+print("N = new signal, Ctrl+T = stop.")
+
+local timer = os.startTimer(FRAME)
+while true do
+  local ev, a = os.pullEvent()
+  if ev == "timer" and a == timer then
+    timer = os.startTimer(FRAME)
+    update()
+    draw()
+  elseif ev == "key" and a == keys.n then
+    newSignal()
+    setState("lock", 1.5)
+  elseif ev == "monitor_resize" then
+    setup()
+  end
+end
