@@ -1,0 +1,232 @@
+-- seismo.lua - fake seismograph for CC:Tweaked
+-- Built for BASIC monitors (greyscale, no touch).
+-- 5x1 horizontal: trace scrolls right-to-left.
+-- 1x5 vertical:   trace scrolls upward like a paper drum.
+-- Uses 2x3 sub-pixel characters for a smoother, higher-resolution trace.
+-- Keys on the computer: T = trigger a test quake.
+
+local ALARM_SIDE = nil   -- e.g. "back" to output redstone during an EARTHQUAKE
+local TICK = 0.05        -- 20 samples per second
+
+local mon = peripheral.find("monitor")
+if not mon then error("No monitor attached", 0) end
+
+-- blit colour codes (greys only - basic monitor)
+local WHITE, LGRAY, GRAY, BLACK = "0", "8", "7", "f"
+local PRI = { [BLACK] = 0, [GRAY] = 1, [LGRAY] = 2, [WHITE] = 3 }
+local BITS = { 1, 2, 4, 8, 16 }
+
+local W, H, vertical, headerRows, plotTop, plotRows, PW, PH, timeLen, ampLen
+local samples = {}
+local sampleCount = 0
+local events = {}
+local eventTotal, peakMag = 0, 0
+local clipTimer = 0
+
+local function setup()
+  mon.setTextScale(0.5)
+  W, H = mon.getSize()
+  vertical = H > W
+  headerRows = vertical and 2 or 1
+  plotTop = headerRows + 1
+  plotRows = H - headerRows - 1
+  PW, PH = W * 2, plotRows * 3
+  timeLen = vertical and PH or PW
+  ampLen = vertical and PW or PH
+  while #samples > timeLen do table.remove(samples, 1) end
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+end
+
+-- ---------- quake simulation ----------
+local function newEvent(mag)
+  if not mag then
+    local r = math.random()
+    if r < 0.75 then mag = 1.0 + math.random() * 1.9
+    elseif r < 0.95 then mag = 3.0 + math.random() * 1.4
+    else mag = 4.5 + math.random() * 2.0 end
+  end
+  local t = sampleCount * TICK
+  table.insert(events, {
+    t0 = t,
+    mag = mag,
+    A = (mag / 6) ^ 2 * 1.2,       -- M6+ clips the trace
+    sp = 0.5 + mag * 0.3,          -- P to S wave delay
+    decay = 1 + mag,
+    freq = 1.5 + math.random() * 1.5,
+    phase = math.random() * math.pi * 2,
+  })
+  eventTotal = eventTotal + 1
+  if mag > peakMag then peakMag = mag end
+end
+
+local function eventValue(e, t)
+  local dt = t - e.t0
+  if dt < 0 then return 0 end
+  local env, f
+  if dt < e.sp then
+    env, f = 0.25 * math.min(1, dt / 0.3), e.freq * 2    -- P wave: small, fast
+  else
+    local ds = dt - e.sp
+    env, f = math.min(1, ds / 0.4) * math.exp(-ds / e.decay), e.freq  -- S wave + coda
+  end
+  local osc = math.sin(dt * f * 2 * math.pi + e.phase) * 0.6 + (math.random() * 2 - 1) * 0.4
+  return e.A * env * osc
+end
+
+local function activeMag()
+  local t, m = sampleCount * TICK, nil
+  for i = #events, 1, -1 do
+    local e = events[i]
+    local dt = t - e.t0
+    if dt > e.sp + e.decay * 4 then
+      table.remove(events, i)
+    elseif dt < e.sp + e.decay * 2 then
+      if not m or e.mag > m then m = e.mag end
+    end
+  end
+  return m
+end
+
+local function step()
+  if math.random() < 0.004 then newEvent() end
+  local t = sampleCount * TICK
+  -- background noise + slow microseism
+  local s = (math.random() * 2 - 1) * 0.02 + math.sin(t * 0.4 * 2 * math.pi) * 0.02
+  for _, e in ipairs(events) do s = s + eventValue(e, t) end
+  if math.abs(s) > 1 then clipTimer = 20 elseif clipTimer > 0 then clipTimer = clipTimer - 1 end
+  s = math.max(-1, math.min(1, s))
+  table.insert(samples, s)
+  if #samples > timeLen then table.remove(samples, 1) end
+  sampleCount = sampleCount + 1
+end
+
+-- ---------- drawing ----------
+local function textRow(y, left, right, fg, bg)
+  right = right or ""
+  local gap = W - #left - #right
+  local s = gap >= 1 and (left .. (" "):rep(gap) .. right) or left
+  s = (s .. (" "):rep(W)):sub(1, W)
+  mon.setCursorPos(1, y)
+  mon.setTextColor(fg)
+  mon.setBackgroundColor(bg)
+  mon.write(s)
+end
+
+local function renderPlot()
+  local px = {}
+  local function plot(ti, ai, c)
+    local x, y
+    if vertical then x, y = ai, ti else x, y = ti, ampLen - ai + 1 end
+    if x < 1 or x > PW or y < 1 or y > PH then return end
+    local k = (y - 1) * PW + x
+    local o = px[k]
+    if not o or PRI[c] > PRI[o] then px[k] = c end
+  end
+
+  local center = (ampLen + 1) / 2
+  local half = (ampLen - 1) / 2
+  local mid = math.floor(center + 0.5)
+
+  -- grid: dotted centre line + time ticks every 2 seconds (scroll with data)
+  for ti = 1, timeLen, 2 do plot(ti, mid, GRAY) end
+  for ti = 1, timeLen do
+    if (sampleCount - (timeLen - ti)) % 40 == 0 then
+      for ai = 1, ampLen, 3 do plot(ti, ai, GRAY) end
+    end
+  end
+
+  -- trace
+  local offset = timeLen - #samples
+  local prev
+  for i, s in ipairs(samples) do
+    local a = math.max(1, math.min(ampLen, math.floor(center + s * half + 0.5)))
+    local lo, hi = a, a
+    if prev then lo, hi = math.min(prev, a), math.max(prev, a) end
+    for aa = lo, hi do plot(offset + i, aa, WHITE) end
+    prev = a
+  end
+
+  -- convert 2x3 pixel blocks to teletext characters
+  for row = 1, plotRows do
+    local text, fg, bg = {}, {}, {}
+    local y0 = (row - 1) * 3
+    for col = 1, W do
+      local x0 = (col - 1) * 2
+      local p = {
+        px[y0 * PW + x0 + 1], px[y0 * PW + x0 + 2],
+        px[(y0 + 1) * PW + x0 + 1], px[(y0 + 1) * PW + x0 + 2],
+        px[(y0 + 2) * PW + x0 + 1], px[(y0 + 2) * PW + x0 + 2],
+      }
+      local c = BLACK
+      for i = 1, 6 do
+        if p[i] and PRI[p[i]] > PRI[c] then c = p[i] end
+      end
+      local inv = p[6] ~= nil
+      local n = 128
+      for i = 1, 5 do
+        local on = p[i] ~= nil
+        if inv then on = not on end
+        if on then n = n + BITS[i] end
+      end
+      text[col] = string.char(n)
+      if inv then fg[col], bg[col] = BLACK, c else fg[col], bg[col] = c, BLACK end
+    end
+    mon.setCursorPos(1, plotTop + row - 1)
+    mon.blit(table.concat(text), table.concat(fg), table.concat(bg))
+  end
+end
+
+local function draw()
+  local m = activeMag()
+  local magStr = m and string.format("%.1f", m) or "--"
+  local peakStr = peakMag > 0 and string.format("%.1f", peakMag) or "--"
+  local clip = clipTimer > 0 and "CLIP" or ""
+
+  local status, sfg, sbg
+  if not m then status, sfg, sbg = "QUIET", colors.lightGray, colors.black
+  elseif m < 4 then status, sfg, sbg = "TREMOR", colors.black, colors.lightGray
+  else
+    status = "EARTHQUAKE"
+    if (os.clock() * 4) % 2 < 1 then sfg, sbg = colors.black, colors.white
+    else sfg, sbg = colors.white, colors.black end
+  end
+  if ALARM_SIDE then redstone.setOutput(ALARM_SIDE, status == "EARTHQUAKE") end
+
+  if vertical then
+    textRow(1, " SEISMO STN-01", nil, colors.black, colors.lightGray)
+    textRow(2, " M" .. magStr .. " EV" .. eventTotal, clip .. " ", colors.white, colors.black)
+    textRow(H, " " .. status, nil, sfg, sbg)
+  else
+    textRow(1,
+      " SEISMOGRAPH STN-01   MAG " .. magStr .. "   PEAK " .. peakStr ..
+      "   EVENTS " .. eventTotal .. "   " .. clip,
+      textutils.formatTime(os.time(), true) .. " ",
+      colors.black, colors.lightGray)
+    textRow(H, " STATUS: " .. status,
+      "20 SPS  " .. math.floor(timeLen / 20) .. "s WINDOW ", sfg, sbg)
+  end
+
+  renderPlot()
+end
+
+-- ---------- main ----------
+setup()
+term.clear()
+term.setCursorPos(1, 1)
+print("Seismograph running on monitor.")
+print("T = test quake, Ctrl+T = stop.")
+
+local timer = os.startTimer(TICK)
+while true do
+  local ev, a = os.pullEvent()
+  if ev == "timer" and a == timer then
+    timer = os.startTimer(TICK)
+    step()
+    if sampleCount % 2 == 0 then draw() end   -- redraw at 10 fps
+  elseif ev == "key" and a == keys.t then
+    newEvent(5 + math.random() * 1.5)
+  elseif ev == "monitor_resize" then
+    setup()
+  end
+end
