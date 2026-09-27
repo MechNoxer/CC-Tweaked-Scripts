@@ -1,0 +1,244 @@
+-- geiger.lua - fake Geiger counter for CC:Tweaked
+-- Needs: monitor (1x3 vertical or 3x1 horizontal, auto-detected)
+-- Optional: speaker (touch the SOUND button on the monitor, or press S)
+
+local TICK = 0.05          -- one game tick
+local AVG_SECONDS = 10     -- window for the displayed CPM
+local MAX_HIST = 120       -- seconds of history kept
+
+local mon = peripheral.find("monitor")
+if not mon then error("No monitor attached", 0) end
+local speaker = peripheral.find("speaker")
+
+local W, H, screen, vertical
+local soundOn = speaker ~= nil
+local rate, target = 20, 20    -- "true" background rate in CPM
+local current, total = 0, 0    -- clicks this second / all-time
+local history = {}             -- clicks per second
+local tickCount, flash = 0, 0
+local btn = { x = 0, y = 0, w = 0, h = 0 }
+
+-- 3x5 big digit font
+local FONT = {
+  ["0"] = { "###", "# #", "# #", "# #", "###" },
+  ["1"] = { " # ", "## ", " # ", " # ", "###" },
+  ["2"] = { "###", "  #", "###", "#  ", "###" },
+  ["3"] = { "###", "  #", "###", "  #", "###" },
+  ["4"] = { "# #", "# #", "###", "  #", "  #" },
+  ["5"] = { "###", "#  ", "###", "  #", "###" },
+  ["6"] = { "###", "#  ", "###", "# #", "###" },
+  ["7"] = { "###", "  #", "  #", "  #", "  #" },
+  ["8"] = { "###", "# #", "###", "# #", "###" },
+  ["9"] = { "###", "# #", "###", "  #", "###" },
+}
+
+local function setup()
+  mon.setTextScale(0.5)
+  W, H = mon.getSize()
+  screen = window.create(mon, 1, 1, W, H, false)
+  vertical = H > W
+end
+
+-- ---------- helpers ----------
+local function fill(x, y, w, h, bg)
+  if w < 1 or h < 1 then return end
+  screen.setBackgroundColor(bg)
+  local line = (" "):rep(w)
+  for i = 0, h - 1 do
+    screen.setCursorPos(x, y + i)
+    screen.write(line)
+  end
+end
+
+local function centerIn(x, w, y, text, fg, bg)
+  screen.setTextColor(fg or colors.white)
+  screen.setBackgroundColor(bg or colors.black)
+  screen.setCursorPos(x + math.max(0, math.floor((w - #text) / 2)), y)
+  screen.write(text)
+end
+
+local function level(cpm)
+  if cpm < 50 then return "NORMAL", colors.lime
+  elseif cpm < 300 then return "ELEVATED", colors.yellow
+  elseif cpm < 1000 then return "HIGH", colors.orange
+  else return "DANGER", colors.red end
+end
+
+local function bigNumber(n, x, w, y, color)
+  local s = tostring(n)
+  local sx = x + math.max(0, math.floor((w - (#s * 4 - 1)) / 2))
+  screen.setBackgroundColor(color)
+  for i = 1, #s do
+    local g = FONT[s:sub(i, i)]
+    for r = 1, 5 do
+      for c = 1, 3 do
+        if g[r]:sub(c, c) == "#" then
+          screen.setCursorPos(sx + (i - 1) * 4 + c - 1, y + r - 1)
+          screen.write(" ")
+        end
+      end
+    end
+  end
+end
+
+local function measuredCPM()
+  local n = math.min(AVG_SECONDS, #history)
+  local sum = current
+  for i = #history - n + 1, #history do sum = sum + history[i] end
+  local secs = n + tickCount / 20
+  if secs < 1 then return rate end
+  return sum / secs * 60
+end
+
+local function graph(x, y, w, h)
+  if w < 1 or h < 1 then return end
+  fill(x, y, w, h, colors.black)
+  local maxv = 1
+  for i = math.max(1, #history - w + 1), #history do
+    maxv = math.max(maxv, history[i])
+  end
+  for c = 0, w - 1 do
+    local v = history[#history - (w - 1 - c)]
+    if v and v > 0 then
+      local bh = math.max(1, math.floor(v / maxv * h + 0.5))
+      local _, col = level(v * 60)
+      fill(x + c, y + h - bh, 1, bh, col)
+    end
+  end
+end
+
+local function button(x, y, w, h)
+  btn = { x = x, y = y, w = w, h = h }
+  local bg, label
+  if not speaker then bg, label = colors.gray, "NO SPEAKER"
+  elseif soundOn then bg, label = colors.green, "SOUND ON"
+  else bg, label = colors.red, "SOUND OFF" end
+  fill(x, y, w, h, bg)
+  centerIn(x, w, y + math.floor((h - 1) / 2), label, colors.white, bg)
+end
+
+-- ---------- simulation ----------
+local function poisson(lambda)
+  local L, p, n = math.exp(-lambda), 1, 0
+  repeat n = n + 1; p = p * math.random() until p <= L
+  return n - 1
+end
+
+local function step()
+  -- every ~5s on average, drift toward a new radiation level
+  if math.random() < 0.01 then
+    local r = math.random()
+    if r < 0.70 then target = math.random(12, 35)
+    elseif r < 0.88 then target = math.random(60, 250)
+    elseif r < 0.97 then target = math.random(300, 1200)
+    else target = math.random(1500, 6000) end
+  end
+  rate = rate + (target - rate) * 0.03
+
+  local n = poisson(rate / 60 * TICK)
+  if n > 0 then
+    current, total = current + n, total + n
+    flash = 2
+    if soundOn and speaker then
+      pcall(speaker.playNote, "hat", math.min(3, 0.6 + n * 0.3), math.random(20, 24))
+    end
+  elseif flash > 0 then
+    flash = flash - 1
+  end
+
+  tickCount = tickCount + 1
+  if tickCount >= 20 then
+    tickCount = 0
+    table.insert(history, current)
+    current = 0
+    while #history > MAX_HIST do table.remove(history, 1) end
+  end
+end
+
+-- ---------- drawing ----------
+local function draw()
+  screen.setVisible(false)
+  screen.setBackgroundColor(colors.black)
+  screen.clear()
+
+  local cpm = measuredCPM()
+  local shown = math.min(9999, math.floor(cpm + 0.5))
+  local usv = string.format("%.2f", cpm / 153.8) -- SBM-20 style factor
+  local name, col = level(cpm)
+  local blink = name == "DANGER" and (os.clock() * 4) % 2 < 1
+  local titleBg = flash > 0 and colors.white or colors.gray
+
+  if vertical then
+    fill(1, 1, W, 1, titleBg)
+    centerIn(1, W, 1, "GEIGER", colors.black, titleBg)
+    bigNumber(shown, 1, W, 3, col)
+    centerIn(1, W, 9, "CPM", colors.lightGray)
+    centerIn(1, W, 11, usv, colors.white)
+    centerIn(1, W, 12, "uSv/h", colors.lightGray)
+    local sbg = blink and colors.black or col
+    fill(1, 14, W, 1, sbg)
+    centerIn(1, W, 14, name, blink and col or colors.black, sbg)
+    graph(1, 16, W, H - 20)
+    screen.setCursorPos(1, H - 4)
+    screen.setBackgroundColor(colors.black)
+    screen.setTextColor(colors.gray)
+    screen.write(("TOT " .. total):sub(1, W))
+    button(1, H - 2, W, 3)
+  else
+    local LW = 17
+    fill(1, 1, W, 1, titleBg)
+    screen.setCursorPos(2, 1)
+    screen.setTextColor(colors.black)
+    screen.write("GEIGER COUNTER")
+    local sbg = blink and colors.black or col
+    screen.setCursorPos(W - #name - 1, 1)
+    screen.setBackgroundColor(sbg)
+    screen.setTextColor(blink and col or colors.black)
+    screen.write(" " .. name .. " ")
+    bigNumber(shown, 1, LW, 3, col)
+    centerIn(1, LW, 8, "CPM", colors.lightGray)
+    centerIn(1, LW, 9, usv .. " uSv/h", colors.white)
+    button(1, H, LW, math.max(1, H - 9))
+    if H > 10 then button(1, 10, LW, H - 9) end
+    graph(LW + 2, 3, W - LW - 2, H - 3)
+    local tot = "TOT " .. total
+    screen.setCursorPos(W - #tot + 1, H)
+    screen.setBackgroundColor(colors.black)
+    screen.setTextColor(colors.gray)
+    screen.write(tot)
+  end
+
+  screen.setVisible(true)
+end
+
+local function toggleSound()
+  if speaker then soundOn = not soundOn end
+end
+
+-- ---------- main ----------
+setup()
+term.clear()
+term.setCursorPos(1, 1)
+print("Geiger counter running on monitor.")
+print("S = toggle sound, Ctrl+T = stop.")
+
+local timer = os.startTimer(TICK)
+while true do
+  local ev, a, b, c = os.pullEvent()
+  if ev == "timer" and a == timer then
+    timer = os.startTimer(TICK)
+    step()
+    draw()
+  elseif ev == "monitor_touch" then
+    if b >= btn.x and b < btn.x + btn.w and c >= btn.y and c < btn.y + btn.h then
+      toggleSound()
+    end
+  elseif ev == "key" and a == keys.s then
+    toggleSound()
+  elseif ev == "peripheral" or ev == "peripheral_detach" then
+    speaker = peripheral.find("speaker")
+    if not speaker then soundOn = false end
+  elseif ev == "monitor_resize" then
+    setup()
+  end
+end
