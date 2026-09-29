@@ -2,7 +2,7 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
-local VERSION   = "1.1.0"
+local VERSION   = "1.1.1"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -65,16 +65,41 @@ local function ask(prompt, default)
   return v
 end
 
+local function networkInventories()
+  local list = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    if not SIDES[n] and peripheral.hasType(n, "inventory") then list[#list + 1] = n end
+  end
+  table.sort(list)
+  return list
+end
+
+-- The ME Bridge does the export, so the chest must be on the wired network
+-- (wired modem on the chest), not just touching this computer.
+local function pickChest()
+  while true do
+    local inv = networkInventories()
+    if #inv == 0 then
+      print("No chests on the wired network.")
+      print("Put a wired modem on the chest, connect it")
+      print("to the cable and right-click the modem.")
+      write("Press Enter to rescan...") read()
+    else
+      print("Chests on the network:")
+      for i, n in ipairs(inv) do print(("  %d) %s"):format(i, n)) end
+      local i = tonumber(ask("Target chest number"))
+      if inv[i] then return inv[i] end
+      print("Invalid choice.")
+    end
+  end
+end
+
 local function setup()
   term.clear(); term.setCursorPos(1, 1)
   print("== Production line setup ==")
   local c = {}
   repeat c.name = ask("Line name (unique)") until c.name
-  print("Inventories on the network:")
-  for _, n in ipairs(peripheral.getNames()) do
-    if peripheral.hasType(n, "inventory") then print("  " .. n) end
-  end
-  repeat c.chest = ask("Target chest (name above, or side of ME Bridge)") until c.chest
+  c.chest = pickChest()
   c.clutchSide = ask("Clutch redstone side", "back")
   c.stopWhenPowered = ask("Clutch stops line when powered? (y/n)", "y"):lower() == "y"
   c.on = false
@@ -83,6 +108,12 @@ local function setup()
 end
 
 local cfg = loadCfg() or setup()
+if SIDES[cfg.chest] or not peripheral.isPresent(cfg.chest) then
+  term.clear(); term.setCursorPos(1, 1)
+  print("Chest '" .. tostring(cfg.chest) .. "' is not on the wired network.")
+  cfg.chest = pickChest()
+  saveCfg(cfg)
+end
 
 ---------------------------------------------------------------- peripherals
 local bridge = peripheral.find("meBridge") or peripheral.find("me_bridge")
