@@ -2,12 +2,46 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
+local VERSION   = "1.1.0"
+local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
+
 local PROTO     = "factory"
 local CFG       = "line.cfg"
 local HEARTBEAT = 5    -- seconds between status reports
 local REFRESH   = 10   -- seconds between ME list refreshes
 
 local SIDES = { top = true, bottom = true, left = true, right = true, front = true, back = true }
+
+---------------------------------------------------------------- updater
+local function newer(a, b)   -- true if version a > version b
+  local pa, pb = {}, {}
+  for n in a:gmatch("%d+") do pa[#pa + 1] = tonumber(n) end
+  for n in b:gmatch("%d+") do pb[#pb + 1] = tonumber(n) end
+  for i = 1, math.max(#pa, #pb) do
+    local x, y = pa[i] or 0, pb[i] or 0
+    if x ~= y then return x > y end
+  end
+  return false
+end
+
+-- Returns true if the file was replaced (caller should restart)
+local function checkUpdate()
+  if not http then print("HTTP disabled, skipping update check"); return false end
+  term.setBackgroundColor(colors.black); term.setTextColor(colors.white)
+  term.clear(); term.setCursorPos(1, 1)
+  print("v" .. VERSION .. " - checking GitHub for updates...")
+  local res = http.get(UPDATE_URL .. "?t=" .. os.epoch("utc"))
+  if not res then print("Update check failed (offline?)"); sleep(1); return false end
+  local src = res.readAll(); res.close()
+  local remote = src:match('local VERSION%s*=%s*"([^"]+)"')
+  if not remote or not newer(remote, VERSION) then print("Up to date"); return false end
+  print("Updating " .. VERSION .. " -> " .. remote)
+  local f = fs.open(shell.getRunningProgram(), "w"); f.write(src); f.close()
+  sleep(1)
+  return true
+end
+
+if checkUpdate() then return shell.run(shell.getRunningProgram()) end
 
 ---------------------------------------------------------------- config
 local function loadCfg()
@@ -83,7 +117,13 @@ local function label(it)
 end
 
 local function refreshItems()
-  local ok, list, err = pcall(bridge.listItems)
+  local fn = bridge.listItems or bridge.getItems
+  if not fn then
+    msg, msgColor = "Bridge methods: " .. table.concat(peripheral.getMethods(peripheral.getName(bridge)), ","), colors.red
+    return
+  end
+  local ok, list, err
+  if bridge.listItems then ok, list, err = pcall(fn) else ok, list, err = pcall(fn, {}) end
   if not ok or type(list) ~= "table" then
     msg, msgColor = "ME read failed: " .. tostring(ok and err or list), colors.red
     return
@@ -134,6 +174,7 @@ local function draw()
   term.setCursorPos(1, 1)
   term.setBackgroundColor(colors.gray); term.setTextColor(colors.white)
   term.clearLine(); term.write(" " .. cfg.name)
+  term.setTextColor(colors.lightGray); term.write("  v" .. VERSION)
   local st = cfg.on and " RUNNING " or " STOPPED "
   term.setCursorPos(w - #st + 1, 1)
   term.setBackgroundColor(cfg.on and colors.green or colors.red)
@@ -175,7 +216,7 @@ local function draw()
   end
   term.setCursorPos(1, h); term.setTextColor(colors.gray)
   term.write(mode == "amount" and "Enter=send  Bksp on empty=cancel"
-                               or "Type=search Up/Dn Enter=request F5=refresh")
+                               or "Type=search Enter=request F5=refresh F9=update")
 end
 
 local function doRequest()
@@ -199,7 +240,8 @@ local hbTimer = os.startTimer(HEARTBEAT)
 local rfTimer = os.startTimer(REFRESH)
 draw()
 
-while true do
+local relaunch = false
+while not relaunch do
   local ev = { os.pullEvent() }
   local e = ev[1]
 
@@ -232,6 +274,9 @@ while true do
       elseif k == keys.up then sel = math.max(1, sel - 1)
       elseif k == keys.down then sel = math.max(1, math.min(#filtered, sel + 1))
       elseif k == keys.f5 then refreshItems(); applyFilter(); msg, msgColor = "Refreshed", colors.lightGray
+      elseif k == keys.f9 then
+        relaunch = checkUpdate()
+        if not relaunch then msg, msgColor = "Already on latest (v" .. VERSION .. ")", colors.lightGray end
       elseif (k == keys.enter or k == keys.numPadEnter) and filtered[sel] then mode, amountStr = "amount", ""
       end
     else
@@ -257,3 +302,5 @@ while true do
 
   draw()
 end
+
+shell.run(shell.getRunningProgram())
