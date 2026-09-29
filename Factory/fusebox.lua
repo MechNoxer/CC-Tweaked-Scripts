@@ -1,9 +1,43 @@
 -- fusebox.lua : central on/off control for all production lines
--- Shows on an attached monitor (touch) and on the computer screen (click / 1-9 keys).
+-- Shows on an attached monitor (touch) and on the computer screen (click / 1-9 keys, U = update).
+
+local VERSION = "1.1.0"
+local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/fusebox.lua"
 
 local PROTO   = "factory"
 local DATA    = "fusebox.dat"
 local TIMEOUT = 15   -- seconds without heartbeat = OFFLINE
+
+---------------------------------------------------------------- updater
+local function newer(a, b)   -- true if version a > version b
+  local pa, pb = {}, {}
+  for n in a:gmatch("%d+") do pa[#pa + 1] = tonumber(n) end
+  for n in b:gmatch("%d+") do pb[#pb + 1] = tonumber(n) end
+  for i = 1, math.max(#pa, #pb) do
+    local x, y = pa[i] or 0, pb[i] or 0
+    if x ~= y then return x > y end
+  end
+  return false
+end
+
+-- Returns true if the file was replaced (caller should restart)
+local function checkUpdate()
+  if not http then print("HTTP disabled, skipping update check"); return false end
+  term.setBackgroundColor(colors.black); term.setTextColor(colors.white)
+  term.clear(); term.setCursorPos(1, 1)
+  print("v" .. VERSION .. " - checking GitHub for updates...")
+  local res = http.get(UPDATE_URL .. "?t=" .. os.epoch("utc"))
+  if not res then print("Update check failed (offline?)"); sleep(1); return false end
+  local src = res.readAll(); res.close()
+  local remote = src:match('local VERSION%s*=%s*"([^"]+)"')
+  if not remote or not newer(remote, VERSION) then print("Up to date"); return false end
+  print("Updating " .. VERSION .. " -> " .. remote)
+  local f = fs.open(shell.getRunningProgram(), "w"); f.write(src); f.close()
+  sleep(1)
+  return true
+end
+
+if checkUpdate() then return shell.run(shell.getRunningProgram()) end
 
 local modem = peripheral.find("modem", function(_, m) return not m.isWireless() end)
 if not modem then error("No wired modem found", 0) end
@@ -54,7 +88,7 @@ local function drawTo(t)
   t.setBackgroundColor(colors.black); t.clear()
   t.setCursorPos(1, 1)
   t.setBackgroundColor(colors.gray); t.setTextColor(colors.white)
-  t.clearLine(); t.write(" FACTORY FUSEBOX")
+  t.clearLine(); t.write(" FACTORY FUSEBOX  v" .. VERSION)
 
   local names = sorted()
   if #names == 0 then
@@ -109,7 +143,8 @@ load()
 local tick = os.startTimer(1)
 draw()
 
-while true do
+local relaunch = false
+while not relaunch do
   local ev = { os.pullEvent() }
   local e = ev[1]
 
@@ -137,6 +172,9 @@ while true do
   elseif e == "mouse_click" then
     click(term, ev[3], ev[4])
 
+  elseif e == "char" and ev[2] == "u" then
+    relaunch = checkUpdate()
+
   elseif e == "char" then
     local n = tonumber(ev[2])
     local name = n and sorted()[n]
@@ -145,3 +183,5 @@ while true do
 
   draw()
 end
+
+shell.run(shell.getRunningProgram())
