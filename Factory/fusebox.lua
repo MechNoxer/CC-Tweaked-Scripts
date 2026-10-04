@@ -2,7 +2,7 @@
 -- Runs on an advanced monitor (touch tiles, auto-scaled) and mirrors on the computer screen
 -- (click / 1-9 keys, U = update). Click a line name on the computer to set its allowed items.
 
-local VERSION = "1.3.0"
+local VERSION = "1.4.0"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/fusebox.lua"
 
 local PROTO   = "factory"
@@ -231,12 +231,45 @@ local function globToPattern(g)
   return "^" .. g:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
 end
 
-local function covered(allow, id)
+-- Rule formats:  "minecraft:copper_ingot" exact id | "create:*" id pattern
+--                "~ingot" keyword: name or id contains "ingot" (case-insensitive)
+local function ruleMatches(a, id, lbl)
+  if a:sub(1, 1) == "~" then
+    local k = a:sub(2):lower()
+    return id:lower():find(k, 1, true) ~= nil or (lbl ~= nil and lbl:lower():find(k, 1, true) ~= nil)
+  end
+  return a == id or (a:find("*", 1, true) ~= nil and id:find(globToPattern(a)) ~= nil)
+end
+
+local function covered(allow, id, lbl)
   if not allow then return true end
   for _, a in ipairs(allow) do
-    if a == id or (a:find("*", 1, true) and id:find(globToPattern(a))) then return true end
+    if ruleMatches(a, id, lbl) then return true end
   end
   return false
+end
+
+-- "wood, log" -> { "wood", "log" }
+local function keywords(q)
+  local out = {}
+  for raw in q:gmatch("[^,]+") do
+    local k = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    if k ~= "" then out[#out + 1] = k:lower() end
+  end
+  return out
+end
+
+local function matchesAny(kws, id, lbl)
+  if #kws == 0 then return true end
+  for _, k in ipairs(kws) do
+    if id:lower():find(k, 1, true) or lbl:lower():find(k, 1, true) then return true end
+  end
+  return false
+end
+
+local function ruleLabel(a)
+  if a:sub(1, 1) == "~" then return "contains: " .. a:sub(2) end
+  return a
 end
 
 local function loadME()
@@ -256,18 +289,28 @@ local function buildRows()
   if l.allow then
     for _, a in ipairs(l.allow) do exact[a] = true end
   end
-  if q ~= "" and not exact[ed.query] then
-    rows[#rows + 1] = { kind = "add", id = ed.query }
+  local kws = keywords(ed.query)
+  if #kws > 0 then
+    -- keyword rule row: "allow all containing ..."
+    local n = 0
+    for _, it in ipairs(ed.me) do if matchesAny(kws, it.name, itemLabel(it)) then n = n + 1 end end
+    local new = {}
+    for _, k in ipairs(kws) do if not exact["~" .. k] then new[#new + 1] = k end end
+    if #new > 0 then rows[#rows + 1] = { kind = "contains", kws = new, count = n } end
+    -- exact id / pattern row, only when it looks like an id
+    if (ed.query:find(":", 1, true) or ed.query:find("*", 1, true)) and not exact[ed.query] then
+      rows[#rows + 1] = { kind = "add", id = ed.query }
+    end
   end
   if l.allow then
     local sortedAllow = { table.unpack(l.allow) }
     table.sort(sortedAllow)
     for _, a in ipairs(sortedAllow) do
-      if q == "" or a:lower():find(q, 1, true) then rows[#rows + 1] = { kind = "entry", id = a } end
+      if q == "" or matchesAny(kws, a, a) then rows[#rows + 1] = { kind = "entry", id = a } end
     end
   end
   for _, it in ipairs(ed.me) do
-    if not exact[it.name] and (q == "" or itemLabel(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true)) then
+    if not exact[it.name] and matchesAny(kws, it.name, itemLabel(it)) then
       rows[#rows + 1] = { kind = "item", id = it.name, label = itemLabel(it) }
     end
   end
@@ -306,7 +349,10 @@ end
 local function activate(i)
   local r = ed.rows[i]
   if not r then return end
-  if r.kind == "add" then addAllow(r.id); ed.query = ""
+  if r.kind == "contains" then
+    for _, k in ipairs(r.kws) do addAllow("~" .. k) end
+    ed.query = ""
+  elseif r.kind == "add" then addAllow(r.id); ed.query = ""
   elseif r.kind == "entry" then removeAllow(r.id)
   elseif r.kind == "item" then addAllow(r.id); ed.query = "" end
   buildRows()
@@ -345,13 +391,16 @@ local function drawEditor()
     local y = top + i - 1
     t.setCursorPos(1, y)
     t.setBackgroundColor(idx == ed.sel and colors.blue or colors.black); t.clearLine()
-    if r.kind == "add" then
+    if r.kind == "contains" then
+      t.setTextColor(colors.lime)
+      t.write((" + allow all containing: " .. table.concat(r.kws, ", ") .. " (" .. r.count .. " in ME)"):sub(1, w))
+    elseif r.kind == "add" then
       t.setTextColor(colors.lime); t.write((" + add \"" .. r.id .. "\"" .. (r.id:find("*", 1, true) and " (pattern)" or "")):sub(1, w))
     elseif r.kind == "entry" then
       t.setTextColor(colors.lime); t.write(" [x] ")
-      t.setTextColor(colors.white); t.write(r.id:sub(1, w - 5))
+      t.setTextColor(r.id:sub(1, 1) == "~" and colors.yellow or colors.white); t.write(ruleLabel(r.id):sub(1, w - 5))
     else
-      local on = covered(l.allow, r.id)
+      local on = covered(l.allow, r.id, r.label)
       t.setTextColor(on and colors.lime or colors.gray); t.write(on and (l.allow and " [*] " or " [ ] ") or " [ ] ")
       t.setTextColor(colors.white); t.write(r.label:sub(1, w - 6))
       local id = r.id
@@ -359,7 +408,7 @@ local function drawEditor()
     end
   end
   if #ed.rows == 0 then
-    t.setCursorPos(2, top); t.setTextColor(colors.gray); t.write("Type an item id or pattern, e.g. create:*")
+    t.setCursorPos(2, top); t.setTextColor(colors.gray); t.write("Type a word (ingot), list (wood, log) or id/pattern")
   end
 
   t.setBackgroundColor(colors.black); t.setCursorPos(1, h); t.setTextColor(colors.gray)
