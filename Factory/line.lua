@@ -2,7 +2,7 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
-local VERSION   = "1.2.0"
+local VERSION   = "1.3.0"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -141,10 +141,20 @@ local function globToPattern(g)
   return "^" .. g:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
 end
 
-local function isAllowed(id)
+-- Rule formats:  "minecraft:copper_ingot" exact id | "create:*" id pattern
+--                "~ingot" keyword: name or id contains "ingot" (case-insensitive)
+local function ruleMatches(a, id, lbl)
+  if a:sub(1, 1) == "~" then
+    local k = a:sub(2):lower()
+    return id:lower():find(k, 1, true) ~= nil or (lbl ~= nil and lbl:lower():find(k, 1, true) ~= nil)
+  end
+  return a == id or (a:find("*", 1, true) ~= nil and id:find(globToPattern(a)) ~= nil)
+end
+
+local function isAllowed(id, lbl)
   if cfg.allow == nil then return true end
   for _, a in ipairs(cfg.allow) do
-    if a == id or (a:find("*", 1, true) and id:find(globToPattern(a))) then return true end
+    if ruleMatches(a, id, lbl) then return true end
   end
   return false
 end
@@ -182,7 +192,7 @@ local function applyFilter()
   filtered = {}
   local q = query:lower()
   for _, it in ipairs(items) do
-    if isAllowed(it.name) and (q == "" or label(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true)) then
+    if isAllowed(it.name, label(it)) and (q == "" or label(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true)) then
       filtered[#filtered + 1] = it
     end
   end
@@ -270,7 +280,7 @@ local function doRequest()
   local n, it = tonumber(amountStr), filtered[sel]
   mode = "browse"
   if not (n and n > 0 and it) then msg, msgColor = "Cancelled", colors.lightGray; return end
-  if not isAllowed(it.name) then msg, msgColor = "Not allowed on this line", colors.red; return end
+  if not isAllowed(it.name, label(it)) then msg, msgColor = "Not allowed on this line", colors.red; return end
   local moved, err = export(it.name, n)
   if moved == n then
     msg, msgColor = "Sent " .. moved .. "x " .. label(it), colors.lime
@@ -300,7 +310,7 @@ while not relaunch do
       msg, msgColor = "Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange
     elseif type(m) == "table" and m.type == "allow" and m.name == cfg.name then
       cfg.allow, cfg.allowRev = m.allow, m.rev; saveCfg(cfg)
-      if mode == "amount" and filtered[sel] and not isAllowed(filtered[sel].name) then mode = "browse" end
+      if mode == "amount" and filtered[sel] and not isAllowed(filtered[sel].name, label(filtered[sel])) then mode = "browse" end
       applyFilter(); sendStatus()
       msg, msgColor = "Allowed items updated by fusebox", colors.orange
     end
