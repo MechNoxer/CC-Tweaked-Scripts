@@ -1,14 +1,16 @@
--- line.lua : production line terminal
--- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
--- Pulls items from ME into this line's chest, obeys the fusebox.
+-- line.lua : production line server
+-- CC:Tweaked + Advanced Peripherals ME Bridge + Redstone Relay -> Create clutch
+-- Runs jobs given by the fusebox: fills the input chest from ME, runs the line,
+-- drains the buffer chest to ME or directly into the next line's input chest.
 
-local VERSION   = "1.4.2"
+local VERSION    = "2.0.0"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
 local CFG       = "line.cfg"
 local HEARTBEAT = 5    -- seconds between status reports
-local REFRESH   = 10   -- seconds between ME list refreshes
+local TICK      = 1    -- seconds between job steps
+local QUIET     = 10   -- seconds without any movement before a job counts as finished
 
 local SIDES = { top = true, bottom = true, left = true, right = true, front = true, back = true }
 
@@ -33,6 +35,7 @@ local function checkUpdate()
   local res = http.get(UPDATE_URL .. "?t=" .. os.epoch("utc"))
   if not res then print("Update check failed (offline?)"); sleep(1); return false end
   local src = res.readAll(); res.close()
+  if not src:find("production line server", 1, true) then print("GitHub file is not line.lua - skipped"); sleep(2); return false end
   local remote = src:match('local VERSION%s*=%s*"([^"]+)"')
   if not remote or not newer(remote, VERSION) then print("Up to date"); return false end
   print("Updating " .. VERSION .. " -> " .. remote)
@@ -65,29 +68,28 @@ local function ask(prompt, default)
   return v
 end
 
-local function networkInventories()
+local function networkInventories(exclude)
   local list = {}
   for _, n in ipairs(peripheral.getNames()) do
-    if not SIDES[n] and peripheral.hasType(n, "inventory") then list[#list + 1] = n end
+    if not SIDES[n] and n ~= exclude and peripheral.hasType(n, "inventory") then list[#list + 1] = n end
   end
   table.sort(list)
   return list
 end
 
--- The ME Bridge does the export, so the chest must be on the wired network
--- (wired modem on the chest), not just touching this computer.
-local function pickChest()
+-- Chests must be on the wired network (wired modem on the chest), not just touching the computer
+local function pickChest(title, exclude)
   while true do
-    local inv = networkInventories()
+    local inv = networkInventories(exclude)
     if #inv == 0 then
       print("No chests on the wired network.")
       print("Put a wired modem on the chest, connect it")
       print("to the cable and right-click the modem.")
       write("Press Enter to rescan...") read()
     else
-      print("Chests on the network:")
+      print(title .. ":")
       for i, n in ipairs(inv) do print(("  %d) %s"):format(i, n)) end
-      local i = tonumber(ask("Target chest number"))
+      local i = tonumber(ask("Number"))
       if inv[i] then return inv[i] end
       print("Invalid choice.")
     end
@@ -128,77 +130,65 @@ local function pickClutch(c)
   print("don't need to know which side faces the clutch.")
   c.clutchSide = askSide(c.clutchRelay and "Relay side" or "Computer side", "all")
   c.clutchSetup = 2
+  c.stopWhenPowered = ask("Clutch stops line when powered? (y/n)", "y"):lower() == "y"
 end
 
-local function setup()
+local function pickChests(c)
+  c.inputChest  = pickChest("INPUT chest (start of the line, filled from ME)")
+  c.bufferChest = pickChest("BUFFER chest (end of the line, finished items)", c.inputChest)
+end
+
+local cfg = loadCfg()
+if not cfg then
   term.clear(); term.setCursorPos(1, 1)
   print("== Production line setup ==")
-  local c = {}
-  repeat c.name = ask("Line name (unique)") until c.name
-  c.chest = pickChest()
-  pickClutch(c)
-  c.stopWhenPowered = ask("Clutch stops line when powered? (y/n)", "y"):lower() == "y"
-  c.on = false
-  saveCfg(c)
-  return c
-end
-
-local cfg = loadCfg() or setup()
-if SIDES[cfg.chest] or not peripheral.isPresent(cfg.chest) then
-  term.clear(); term.setCursorPos(1, 1)
-  print("Chest '" .. tostring(cfg.chest) .. "' is not on the wired network.")
-  cfg.chest = pickChest()
+  cfg = {}
+  repeat cfg.name = ask("Line name (unique)") until cfg.name
+  pickChests(cfg)
+  pickClutch(cfg)
+  cfg.on = false
   saveCfg(cfg)
 end
--- configs from before relay support: ask once where the clutch is
+
+-- upgrades from v1: "chest" became "inputChest", buffer chest is new
+if cfg.chest and not cfg.inputChest then cfg.inputChest, cfg.chest = cfg.chest, nil end
+if cfg.reconfigure or not (cfg.inputChest and peripheral.isPresent(cfg.inputChest))
+   or not (cfg.bufferChest and peripheral.isPresent(cfg.bufferChest)) then
+  term.clear(); term.setCursorPos(1, 1)
+  print("== Chest setup for line '" .. cfg.name .. "' ==")
+  pickChests(cfg)
+  if cfg.reconfigure then pickClutch(cfg) end
+  cfg.reconfigure = nil
+  saveCfg(cfg)
+end
 if cfg.clutchSetup ~= 2 then
   term.clear(); term.setCursorPos(1, 1)
-  print("Clutch output setup (new: Redstone Relay support)")
   pickClutch(cfg)
   saveCfg(cfg)
 end
 
 ---------------------------------------------------------------- peripherals
 local bridge = peripheral.find("meBridge") or peripheral.find("me_bridge")
-if not bridge then error("No ME Bridge found (attach it or connect it via wired modem)", 0) end
+if not bridge then error("No ME Bridge found (connect it via wired modem)", 0) end
 
 local modem = peripheral.find("modem", function(_, m) return not m.isWireless() end)
 if not modem then error("No wired modem found", 0) end
 rednet.open(peripheral.getName(modem))
 
----------------------------------------------------------------- line state
-local clutchOk = true
-
-local function applyState()
-  local powered = cfg.on
-  if cfg.stopWhenPowered then powered = not cfg.on end
-  local out = redstone
-  if cfg.clutchRelay then out = peripheral.wrap(cfg.clutchRelay) end
-  if out then
-    if cfg.clutchSide == "all" then
-      for side in pairs(SIDES) do out.setOutput(side, powered) end
-    else
-      out.setOutput(cfg.clutchSide, powered)
-    end
-    clutchOk = true
-  else
-    clutchOk = false   -- relay missing; retried every heartbeat
-  end
-end
-
-local function sendStatus()
-  rednet.broadcast({ type = "status", name = cfg.name, on = cfg.on, rev = cfg.allowRev or 0, allow = cfg.allow }, PROTO)
+---------------------------------------------------------------- log
+local logLines = {}
+local function log(text, color)
+  table.insert(logLines, 1, { t = text, c = color or colors.lightGray })
+  while #logLines > 6 do table.remove(logLines) end
 end
 
 ---------------------------------------------------------------- allowlist
 -- cfg.allow == nil  -> every item allowed
--- cfg.allow == {..} -> only these item ids / patterns ("create:*", "*_ingot")
+-- rules: "minecraft:copper_ingot" exact | "create:*" pattern | "~ingot" name/id contains
 local function globToPattern(g)
   return "^" .. g:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
 end
 
--- Rule formats:  "minecraft:copper_ingot" exact id | "create:*" id pattern
---                "~ingot" keyword: name or id contains "ingot" (case-insensitive)
 local function ruleMatches(a, id, lbl)
   if a:sub(1, 1) == "~" then
     local k = a:sub(2):lower()
@@ -216,57 +206,16 @@ local function isAllowed(id, lbl)
 end
 
 ---------------------------------------------------------------- ME access
-local items, filtered = {}, {}
-local query, sel, scroll = "", 1, 0
-local mode, amountStr = "browse", ""
-local msg, msgColor = "Ready", colors.lightGray
-
-local function amountOf(it) return it.amount or it.count or 0 end
-
-local function label(it)
-  local d = it.displayName or it.name
-  return (d:gsub("^%[(.*)%]$", "%1"))
-end
-
-local function refreshItems()
-  local fn = bridge.listItems or bridge.getItems
-  if not fn then
-    msg, msgColor = "Bridge methods: " .. table.concat(peripheral.getMethods(peripheral.getName(bridge)), ","), colors.red
-    return
-  end
-  local ok, list, err
-  if bridge.listItems then ok, list, err = pcall(fn) else ok, list, err = pcall(fn, {}) end
-  if not ok or type(list) ~= "table" then
-    msg, msgColor = "ME read failed: " .. tostring(ok and err or list), colors.red
-    return
-  end
-  items = list
-  table.sort(items, function(a, b) return label(a):lower() < label(b):lower() end)
-end
-
-local function applyFilter()
-  filtered = {}
-  local q = query:lower()
-  for _, it in ipairs(items) do
-    if isAllowed(it.name, label(it)) and (q == "" or label(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true)) then
-      filtered[#filtered + 1] = it
-    end
-  end
-  sel = math.max(1, math.min(sel, #filtered))
-end
-
--- Export in a loop: the bridge may move less than requested per call
-local function export(name, count)
+-- Advanced Peripherals renamed these between versions; try both forms.
+local function export(name, count, target)
   local moved = 0
   while moved < count do
     local req = { name = name, count = count - moved }
     local ok, n, err
-    if SIDES[cfg.chest] then
-      ok, n, err = pcall(bridge.exportItem, req, cfg.chest)
-    elseif bridge.exportItemToPeripheral then
-      ok, n, err = pcall(bridge.exportItemToPeripheral, req, cfg.chest)
+    if bridge.exportItemToPeripheral then
+      ok, n, err = pcall(bridge.exportItemToPeripheral, req, target)
     else
-      ok, n, err = pcall(bridge.exportItem, req, cfg.chest)
+      ok, n, err = pcall(bridge.exportItem, req, target)
     end
     if not ok then return moved, n end
     if type(n) ~= "number" or n <= 0 then return moved, err end
@@ -275,83 +224,264 @@ local function export(name, count)
   return moved
 end
 
----------------------------------------------------------------- UI
-local w, h = term.getSize()
-local listTop, listBottom = 4, h - 2
-
-local function draw()
-  term.setBackgroundColor(colors.black); term.clear()
-
-  -- header
-  term.setCursorPos(1, 1)
-  term.setBackgroundColor(colors.gray); term.setTextColor(colors.white)
-  term.clearLine(); term.write(" " .. cfg.name)
-  term.setTextColor(colors.lightGray); term.write("  v" .. VERSION)
-  local st = (not clutchOk) and " NO RELAY " or (cfg.on and " RUNNING " or " STOPPED ")
-  term.setCursorPos(w - #st + 1, 1)
-  term.setBackgroundColor((not clutchOk) and colors.orange or (cfg.on and colors.green or colors.red))
-  term.write(st)
-
-  -- search bar
-  term.setBackgroundColor(colors.black)
-  term.setCursorPos(1, 2); term.setTextColor(colors.yellow); term.write("Search: ")
-  term.setTextColor(colors.white); term.write(query)
-  term.setCursorPos(1, 3); term.setTextColor(colors.gray); term.write(string.rep("-", w))
-
-  -- item list
-  local rows = listBottom - listTop + 1
-  if sel < scroll + 1 then scroll = sel - 1 end
-  if sel > scroll + rows then scroll = sel - rows end
-  for i = 1, rows do
-    local it = filtered[scroll + i]
-    if not it then break end
-    local y = listTop + i - 1
-    term.setCursorPos(1, y)
-    term.setBackgroundColor(scroll + i == sel and colors.blue or colors.black)
-    term.setTextColor(colors.white); term.clearLine()
-    local cnt = tostring(amountOf(it))
-    term.write(" " .. label(it):sub(1, w - #cnt - 3))
-    term.setCursorPos(w - #cnt, y); term.setTextColor(colors.lightGray); term.write(cnt)
-  end
-  if #filtered == 0 then
-    term.setCursorPos(2, listTop); term.setTextColor(colors.gray)
-    term.write((cfg.allow and #cfg.allow == 0) and "No items allowed - set them on the fusebox" or "No items")
-  end
-
-  -- status / amount prompt
-  term.setBackgroundColor(colors.black)
-  term.setCursorPos(1, h - 1)
-  if mode == "amount" then
-    term.setTextColor(colors.yellow); term.write("Amount of " .. label(filtered[sel]) .. ": ")
-    term.setTextColor(colors.white); term.write(amountStr)
+local function import(name, count, source)
+  local req = { name = name, count = count }
+  local ok, n, err
+  if bridge.importItemFromPeripheral then
+    ok, n, err = pcall(bridge.importItemFromPeripheral, req, source)
   else
-    term.setTextColor(msgColor); term.write(msg:sub(1, w))
+    ok, n, err = pcall(bridge.importItem, req, source)
   end
-  term.setCursorPos(1, h); term.setTextColor(colors.gray)
-  term.write(mode == "amount" and "Enter=send  Bksp on empty=cancel"
-                               or "Type=search Enter=request F5=refresh F9=update")
+  if not ok then return 0, n end
+  if type(n) ~= "number" then return 0, err end
+  return n, err
 end
 
-local function doRequest()
-  local n, it = tonumber(amountStr), filtered[sel]
-  mode = "browse"
-  if not (n and n > 0 and it) then msg, msgColor = "Cancelled", colors.lightGray; return end
-  if not isAllowed(it.name, label(it)) then msg, msgColor = "Not allowed on this line", colors.red; return end
-  local moved, err = export(it.name, n)
-  if moved == n then
-    msg, msgColor = "Sent " .. moved .. "x " .. label(it), colors.lime
-  else
-    msg, msgColor = "Sent " .. moved .. "/" .. n .. (err and (" - " .. tostring(err)) or " (chest full?)"), colors.orange
+-- nil when unknown
+local function meCount(name)
+  if not bridge.getItem then return nil end
+  local ok, it = pcall(bridge.getItem, { name = name })
+  if not ok then return nil end
+  if type(it) ~= "table" then return 0 end
+  return it.amount or it.count or 0
+end
+
+---------------------------------------------------------------- inventories
+local function list(chest)
+  local p = peripheral.wrap(chest)
+  if not p then return nil end
+  local ok, l = pcall(p.list)
+  if ok and type(l) == "table" then return l, p end
+  return nil
+end
+
+local function countIn(l, names)
+  local n = 0
+  for _, it in pairs(l) do
+    if not names or names[it.name] then n = n + it.count end
   end
-  refreshItems(); applyFilter()
+  return n
+end
+
+---------------------------------------------------------------- clutch
+local clutchOk = true
+
+local function job() return cfg.job end
+
+local function running()
+  local j = job()
+  return cfg.on and j ~= nil and (j.state == "running")
+end
+
+local function applyState()
+  local run = running()
+  local powered = run
+  if cfg.stopWhenPowered then powered = not run end
+  local out = redstone
+  if cfg.clutchRelay then out = peripheral.wrap(cfg.clutchRelay) end
+  if out then
+    if cfg.clutchSide == "all" then
+      for side in pairs(SIDES) do out.setOutput(side, powered) end
+    else
+      out.setOutput(cfg.clutchSide, powered)
+    end
+    clutchOk = true
+  else
+    clutchOk = false   -- relay missing; retried every tick
+  end
+end
+
+---------------------------------------------------------------- status
+local function sendStatus()
+  local j, js = job(), nil
+  if j then
+    js = { id = j.id, state = j.state, produced = j.produced or 0, warn = j.warn, inputs = {} }
+    for i, inp in ipairs(j.inputs) do
+      js.inputs[i] = { name = inp.name, count = inp.count, loaded = inp.loaded or 0, short = inp.short }
+    end
+  end
+  rednet.broadcast({
+    type = "status", ver = VERSION, name = cfg.name, on = cfg.on,
+    rev = cfg.allowRev or 0, allow = cfg.allow,
+    input = cfg.inputChest, buffer = cfg.bufferChest,
+    job = js, clutchOk = clutchOk,
+  }, PROTO)
+end
+
+---------------------------------------------------------------- job execution
+local activity = os.clock()
+local lastInputTotal = -1
+
+local function inputNames(j)
+  if #j.inputs == 0 then return nil end   -- unknown input (fed by a line with unknown output)
+  local t = {}
+  for _, i in ipairs(j.inputs) do t[i.name] = true end
+  return t
+end
+
+local function stepJob()
+  local j = job()
+  if not j or j.state == "done" then return false end
+  local now, changed = os.clock(), false
+  local inL = list(cfg.inputChest)
+  local bufL, buf = list(cfg.bufferChest)
+  if not inL or not bufL then
+    j.warn = "input or buffer chest missing"
+    return false
+  end
+
+  -- cancelled: return everything in input + buffer to ME, then finish
+  if j.state == "cancel" then
+    for _, src in ipairs({ { cfg.inputChest, inL }, { cfg.bufferChest, bufL } }) do
+      for _, it in pairs(src[2]) do import(it.name, it.count, src[1]) end
+    end
+    local a, b = list(cfg.inputChest), list(cfg.bufferChest)
+    if a and b and next(a) == nil and next(b) == nil then
+      j.state = "done"; j.cancelled = true
+      log("Job cancelled, chests returned to ME", colors.orange)
+    end
+    return true
+  end
+
+  j.warn = nil
+
+  -- 1) load inputs from ME (only while switched on, and only if not fed by another line)
+  if cfg.on and not j.fed then
+    for _, i in ipairs(j.inputs) do
+      local rem = i.count - (i.loaded or 0)
+      if rem > 0 and not i.short then
+        local moved = export(i.name, rem, cfg.inputChest)
+        if moved > 0 then
+          i.loaded = (i.loaded or 0) + moved
+          activity, changed = now, true
+        elseif meCount(i.name) == 0 then
+          i.short = true; changed = true
+          log("ME has no more " .. i.name .. " (" .. (i.loaded or 0) .. "/" .. i.count .. ")", colors.orange)
+        end
+      end
+    end
+  end
+
+  -- 2) drain buffer: job output -> destination, everything else -> ME
+  for slot, it in pairs(bufL) do
+    local isOutput = (j.output == nil or it.name == j.output)
+    local moved = 0
+    if isOutput and type(j.dest) == "table" then
+      local ok, n = pcall(buf.pushItems, j.dest.chest, slot)
+      moved = (ok and type(n) == "number") and n or 0
+      if moved == 0 then j.warn = "can't push to " .. j.dest.line .. " (chest full/missing)" end
+    else
+      moved = import(it.name, it.count, cfg.bufferChest)
+      if moved == 0 then j.warn = "can't import buffer into ME" end
+    end
+    if moved > 0 then
+      activity, changed = now, true
+      if isOutput then j.produced = (j.produced or 0) + moved end
+    end
+  end
+
+  -- 3) watch the input chest for movement
+  local total = countIn(inL, inputNames(j))
+  if total ~= lastInputTotal then activity, lastInputTotal = now, total end
+
+  -- paused: don't let the quiet timer finish the job
+  if not cfg.on then activity = now end
+
+  -- 4) finished?
+  local loaded
+  if j.fed then
+    loaded = j.upstreamDone
+  else
+    loaded = true
+    for _, i in ipairs(j.inputs) do
+      if (i.loaded or 0) < i.count and not i.short then loaded = false end
+    end
+  end
+  local bufNow = list(cfg.bufferChest)
+  if loaded and total == 0 and bufNow and next(bufNow) == nil and now - activity >= QUIET then
+    j.state = "done"; changed = true
+    log("Job done: " .. (j.produced or 0) .. " produced", colors.lime)
+  end
+  return changed
+end
+
+---------------------------------------------------------------- UI
+local w, h = term.getSize()
+
+local function short(id)
+  return (id or "?"):gsub("^[^:]*:", ""):gsub("_", " ")
+end
+
+local function destText(d)
+  if type(d) == "table" then return "line " .. d.line end
+  return "ME"
+end
+
+local function draw()
+  local t = term
+  t.setBackgroundColor(colors.black); t.clear()
+  local j = job()
+
+  -- header
+  t.setCursorPos(1, 1); t.setBackgroundColor(colors.gray); t.setTextColor(colors.white); t.clearLine()
+  t.write(" " .. cfg.name); t.setTextColor(colors.lightGray); t.write("  v" .. VERSION)
+  local st, col
+  if not clutchOk then st, col = " NO RELAY ", colors.orange
+  elseif not cfg.on then st, col = " OFF ", colors.red
+  elseif j and j.state == "running" then st, col = " RUNNING ", colors.green
+  elseif j and j.state == "cancel" then st, col = " CANCELLING ", colors.orange
+  elseif j then st, col = " DONE ", colors.cyan
+  else st, col = " IDLE ", colors.lightGray end
+  t.setCursorPos(w - #st + 1, 1); t.setBackgroundColor(col); t.setTextColor(colors.white); t.write(st)
+  t.setBackgroundColor(colors.black)
+
+  local y = 3
+  local function line(label, text, c)
+    t.setCursorPos(1, y); t.setTextColor(colors.yellow); t.write(label)
+    t.setTextColor(c or colors.white); t.write(tostring(text):sub(1, w - #label))
+    y = y + 1
+  end
+
+  if not j then
+    line("Job:    ", "none - start one on the fusebox", colors.lightGray)
+  else
+    line("Job:    ", "#" .. j.id .. (j.fed and ("  fed by " .. (j.upstream or "?") .. (j.upstreamDone and " (done)" or "")) or ""))
+    if #j.inputs == 0 then line("Input:  ", "whatever arrives from " .. (j.upstream or "?")) end
+    for _, i in ipairs(j.inputs) do
+      local txt = short(i.name)
+      if not j.fed then
+        txt = txt .. "  " .. (i.loaded or 0) .. "/" .. i.count .. (i.short and "  ME EMPTY" or "")
+      end
+      line("Input:  ", txt, i.short and colors.orange or colors.white)
+    end
+    line("Output: ", j.output and short(j.output) or "anything in buffer")
+    line("To:     ", destText(j.dest))
+    line("Made:   ", j.produced or 0, colors.lime)
+    if j.warn then line("Warn:   ", j.warn, colors.orange) end
+  end
+
+  y = y + 1
+  local inL, bufL = list(cfg.inputChest), list(cfg.bufferChest)
+  line("In:     ", cfg.inputChest .. "  (" .. (inL and countIn(inL) or "?") .. " items)", colors.lightGray)
+  line("Buffer: ", cfg.bufferChest .. "  (" .. (bufL and countIn(bufL) or "?") .. " items)", colors.lightGray)
+  line("Clutch: ", (cfg.clutchRelay or "computer") .. " / " .. cfg.clutchSide, colors.lightGray)
+
+  y = y + 1
+  for _, l in ipairs(logLines) do
+    if y >= h then break end
+    t.setCursorPos(1, y); t.setTextColor(l.c); t.write(l.t:sub(1, w)); y = y + 1
+  end
+
+  t.setCursorPos(1, h); t.setTextColor(colors.gray)
+  t.write("F2=setup chests/clutch  F9=update")
 end
 
 ---------------------------------------------------------------- main loop
 applyState()
-refreshItems(); applyFilter()
 sendStatus()
 local hbTimer = os.startTimer(HEARTBEAT)
-local rfTimer = os.startTimer(REFRESH)
+local tickTimer = os.startTimer(TICK)
+log("Line server started", colors.lightGray)
 draw()
 
 local relaunch = false
@@ -361,65 +491,64 @@ while not relaunch do
 
   if e == "rednet_message" and ev[4] == PROTO then
     local m = ev[3]
-    if type(m) == "table" and m.type == "set" and m.name == cfg.name and m.on ~= cfg.on then
-      cfg.on = m.on; saveCfg(cfg); applyState(); sendStatus()
-      msg, msgColor = "Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange
-    elseif type(m) == "table" and m.type == "allow" and m.name == cfg.name then
-      cfg.allow, cfg.allowRev = m.allow, m.rev; saveCfg(cfg)
-      if mode == "amount" and filtered[sel] and not isAllowed(filtered[sel].name, label(filtered[sel])) then mode = "browse" end
-      applyFilter(); sendStatus()
-      msg, msgColor = "Allowed items updated by fusebox", colors.orange
+    if type(m) == "table" and m.name == cfg.name then
+      if m.type == "set" and m.on ~= cfg.on then
+        cfg.on = m.on; saveCfg(cfg); applyState(); sendStatus()
+        log("Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange)
+
+      elseif m.type == "allow" then
+        cfg.allow, cfg.allowRev = m.allow, m.rev; saveCfg(cfg); sendStatus()
+        log("Allowed items updated", colors.orange)
+
+      elseif m.type == "job" then
+        local cur, new = cfg.job, m.job
+        if new == nil then
+          if cur then cfg.job = nil; saveCfg(cfg); log("Job #" .. cur.id .. " closed", colors.lightGray) end
+        elseif not cur or cur.id ~= new.id then
+          -- refuse inputs this line isn't allowed to take
+          local bad
+          for _, i in ipairs(new.inputs or {}) do
+            if not isAllowed(i.name) then bad = i.name end
+          end
+          new.inputs = new.inputs or {}
+          new.state, new.produced = "running", 0
+          if bad then new.state, new.warn = "done", "input not allowed: " .. bad end
+          cfg.job = new; saveCfg(cfg)
+          activity, lastInputTotal = os.clock(), -1
+          log("New job #" .. new.id .. (bad and " REFUSED (not allowed)" or ""), bad and colors.red or colors.lime)
+        else
+          -- same job: take over flags the fusebox may change later
+          cur.upstreamDone, cur.dest = new.upstreamDone, new.dest
+          saveCfg(cfg)
+        end
+        applyState(); sendStatus()
+
+      elseif m.type == "cancel" and cfg.job and cfg.job.id == m.id and cfg.job.state ~= "done" then
+        cfg.job.state = "cancel"; saveCfg(cfg); applyState(); sendStatus()
+      end
     end
 
   elseif e == "timer" then
     if ev[2] == hbTimer then
-      applyState(); sendStatus(); hbTimer = os.startTimer(HEARTBEAT)
-    elseif ev[2] == rfTimer then
-      if mode == "browse" then refreshItems(); applyFilter() end
-      rfTimer = os.startTimer(REFRESH)
-    end
-
-  elseif e == "char" then
-    if mode == "browse" then
-      query = query .. ev[2]; sel = 1; applyFilter()
-    elseif ev[2]:match("%d") and #amountStr < 6 then
-      amountStr = amountStr .. ev[2]
+      sendStatus(); hbTimer = os.startTimer(HEARTBEAT)
+    elseif ev[2] == tickTimer then
+      if stepJob() then saveCfg(cfg) end
+      applyState()
+      tickTimer = os.startTimer(TICK)
     end
 
   elseif e == "key" then
-    local k = ev[2]
-    if mode == "browse" then
-      if k == keys.backspace then query = query:sub(1, -2); sel = 1; applyFilter()
-      elseif k == keys.up then sel = math.max(1, sel - 1)
-      elseif k == keys.down then sel = math.max(1, math.min(#filtered, sel + 1))
-      elseif k == keys.f5 then refreshItems(); applyFilter(); msg, msgColor = "Refreshed", colors.lightGray
-      elseif k == keys.f9 then
-        relaunch = checkUpdate()
-        if not relaunch then msg, msgColor = "Already on latest (v" .. VERSION .. ")", colors.lightGray end
-      elseif (k == keys.enter or k == keys.numPadEnter) and filtered[sel] then mode, amountStr = "amount", ""
-      end
-    else
-      if k == keys.backspace then
-        if amountStr == "" then mode = "browse" else amountStr = amountStr:sub(1, -2) end
-      elseif k == keys.enter or k == keys.numPadEnter then
-        doRequest()
-      end
+    if ev[2] == keys.f9 then
+      relaunch = checkUpdate()
+    elseif ev[2] == keys.f2 then
+      cfg.reconfigure = true; saveCfg(cfg); relaunch = true
     end
 
-  elseif e == "mouse_click" and mode == "browse" then
-    local y = ev[4]
-    if y >= listTop and y <= listBottom then
-      local idx = scroll + (y - listTop + 1)
-      if filtered[idx] then
-        if idx == sel then mode, amountStr = "amount", "" else sel = idx end
-      end
-    end
-
-  elseif e == "mouse_scroll" and mode == "browse" then
-    sel = math.max(1, math.min(#filtered, sel + ev[2]))
+  elseif e == "peripheral" or e == "peripheral_detach" then
+    applyState()
   end
 
-  draw()
+  if not relaunch then draw() end
 end
 
 shell.run(shell.getRunningProgram())
