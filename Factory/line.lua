@@ -3,7 +3,7 @@
 -- Runs jobs given by the fusebox: fills the input chest from ME, runs the line,
 -- drains the buffer chest to ME or directly into the next line's input chest.
 
-local VERSION    = "2.0.2"
+local VERSION    = "2.0.3"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -227,16 +227,23 @@ local function countItem(chest, name)
   return n
 end
 
--- one bridge call; returns moved count (measured), error text
+local function describe(ok, r, err)
+  if not ok then return "error: " .. tostring(r) end
+  local t = type(r) == "table" and textutils.serialize(r):gsub("%s+", " ") or tostring(r)
+  return t .. (err and (", " .. tostring(err)) or "")
+end
+
+-- one bridge call; returns moved count, and on failure a report of every call form tried
 local function bridgeMove(kind, name, count, chest)
   local before = countItem(chest, name)
   if not before then return 0, "chest " .. chest .. " not found" end
   local list = VARIANTS[kind]
-  local firstErr
+  local tried = {}
   local from, to = 1, #list
   if working[kind] then from, to = working[kind], working[kind] end
   for i = from, to do
-    local fn, targetFirst = bridge[list[i][1]], list[i][2]
+    local fname, targetFirst = list[i][1], list[i][2]
+    local fn = bridge[fname]
     if fn then
       local filter = { name = name, count = count }
       local ok, r, err
@@ -253,10 +260,10 @@ local function bridgeMove(kind, name, count, chest)
         working[kind] = i
         return moved
       end
-      firstErr = firstErr or (not ok and tostring(r)) or (err and tostring(err)) or (r == nil and "nothing moved") or nil
+      tried[#tried + 1] = fname .. (targetFirst and "(chest,filter)" or "(filter,chest)") .. " -> " .. describe(ok, r, err)
     end
   end
-  return 0, firstErr
+  return 0, table.concat(tried, " | ")
 end
 
 local function export(name, count, target)
@@ -512,7 +519,15 @@ local function draw()
     line("Output: ", j.output and short(j.output) or "anything in buffer")
     line("To:     ", destText(j.dest))
     line("Made:   ", j.produced or 0, colors.lime)
-    if j.warn then line("Warn:   ", j.warn, colors.orange) end
+    if j.warn then
+      local rest = j.warn
+      line("Warn:   ", rest:sub(1, w - 8), colors.orange)
+      rest = rest:sub(w - 7)
+      while #rest > 0 and y < h - 4 do
+        t.setCursorPos(1, y); t.setTextColor(colors.orange); t.write(rest:sub(1, w))
+        rest = rest:sub(w + 1); y = y + 1
+      end
+    end
   end
 
   y = y + 1
