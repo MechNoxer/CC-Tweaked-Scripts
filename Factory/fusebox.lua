@@ -1,16 +1,13 @@
--- line.lua : production line terminal
--- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
--- Pulls items from ME into this line's chest, obeys the fusebox.
+-- fusebox.lua : central on/off control for all production lines
+-- Runs on an advanced monitor (touch tiles, auto-scaled) and mirrors on the computer screen
+-- (click / 1-9 keys, U = update). Click a line name on the computer to set its allowed items.
 
-local VERSION   = "1.1.1"
-local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
+local VERSION = "1.3.0"
+local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/fusebox.lua"
 
-local PROTO     = "factory"
-local CFG       = "line.cfg"
-local HEARTBEAT = 5    -- seconds between status reports
-local REFRESH   = 10   -- seconds between ME list refreshes
-
-local SIDES = { top = true, bottom = true, left = true, right = true, front = true, back = true }
+local PROTO   = "factory"
+local DATA    = "fusebox.dat"
+local TIMEOUT = 15   -- seconds without heartbeat = OFFLINE
 
 ---------------------------------------------------------------- updater
 local function newer(a, b)   -- true if version a > version b
@@ -43,233 +40,352 @@ end
 
 if checkUpdate() then return shell.run(shell.getRunningProgram()) end
 
----------------------------------------------------------------- config
-local function loadCfg()
-  if not fs.exists(CFG) then return nil end
-  local f = fs.open(CFG, "r")
-  local t = textutils.unserialize(f.readAll())
-  f.close()
-  return t
-end
-
-local function saveCfg(t)
-  local f = fs.open(CFG, "w")
-  f.write(textutils.serialize(t))
-  f.close()
-end
-
-local function ask(prompt, default)
-  write(prompt .. (default and (" [" .. default .. "]") or "") .. ": ")
-  local v = read()
-  if v == "" then return default end
-  return v
-end
-
-local function networkInventories()
-  local list = {}
-  for _, n in ipairs(peripheral.getNames()) do
-    if not SIDES[n] and peripheral.hasType(n, "inventory") then list[#list + 1] = n end
-  end
-  table.sort(list)
-  return list
-end
-
--- The ME Bridge does the export, so the chest must be on the wired network
--- (wired modem on the chest), not just touching this computer.
-local function pickChest()
-  while true do
-    local inv = networkInventories()
-    if #inv == 0 then
-      print("No chests on the wired network.")
-      print("Put a wired modem on the chest, connect it")
-      print("to the cable and right-click the modem.")
-      write("Press Enter to rescan...") read()
-    else
-      print("Chests on the network:")
-      for i, n in ipairs(inv) do print(("  %d) %s"):format(i, n)) end
-      local i = tonumber(ask("Target chest number"))
-      if inv[i] then return inv[i] end
-      print("Invalid choice.")
-    end
-  end
-end
-
-local function setup()
-  term.clear(); term.setCursorPos(1, 1)
-  print("== Production line setup ==")
-  local c = {}
-  repeat c.name = ask("Line name (unique)") until c.name
-  c.chest = pickChest()
-  c.clutchSide = ask("Clutch redstone side", "back")
-  c.stopWhenPowered = ask("Clutch stops line when powered? (y/n)", "y"):lower() == "y"
-  c.on = false
-  saveCfg(c)
-  return c
-end
-
-local cfg = loadCfg() or setup()
-if SIDES[cfg.chest] or not peripheral.isPresent(cfg.chest) then
-  term.clear(); term.setCursorPos(1, 1)
-  print("Chest '" .. tostring(cfg.chest) .. "' is not on the wired network.")
-  cfg.chest = pickChest()
-  saveCfg(cfg)
-end
-
----------------------------------------------------------------- peripherals
-local bridge = peripheral.find("meBridge") or peripheral.find("me_bridge")
-if not bridge then error("No ME Bridge found (attach it or connect it via wired modem)", 0) end
-
 local modem = peripheral.find("modem", function(_, m) return not m.isWireless() end)
 if not modem then error("No wired modem found", 0) end
 rednet.open(peripheral.getName(modem))
 
----------------------------------------------------------------- line state
-local function applyState()
-  local powered = cfg.on
-  if cfg.stopWhenPowered then powered = not cfg.on end
-  redstone.setOutput(cfg.clutchSide, powered)
+local mon
+
+---------------------------------------------------------------- state
+-- name -> { id, desired, actual, seen, allow (nil = all items), rev }
+local lines = {}
+
+local function save()
+  local t = {}
+  for name, l in pairs(lines) do t[name] = { on = l.desired, allow = l.allow, rev = l.rev or 0 } end
+  local f = fs.open(DATA, "w"); f.write(textutils.serialize(t)); f.close()
 end
 
-local function sendStatus()
-  rednet.broadcast({ type = "status", name = cfg.name, on = cfg.on }, PROTO)
+local function load()
+  if not fs.exists(DATA) then return end
+  local f = fs.open(DATA, "r")
+  local t = textutils.unserialize(f.readAll()) or {}
+  f.close()
+  for name, d in pairs(t) do
+    if type(d) == "table" then
+      lines[name] = { desired = d.on, allow = d.allow, rev = d.rev or 0 }
+    else
+      lines[name] = { desired = d, rev = 0 }   -- old fusebox.dat format
+    end
+  end
 end
 
----------------------------------------------------------------- ME access
-local items, filtered = {}, {}
-local query, sel, scroll = "", 1, 0
-local mode, amountStr = "browse", ""
-local msg, msgColor = "Ready", colors.lightGray
+local function pushAllow(name)
+  local l = lines[name]
+  if l and l.id then
+    rednet.send(l.id, { type = "allow", name = name, allow = l.allow, rev = l.rev or 0 }, PROTO)
+  end
+end
 
-local function amountOf(it) return it.amount or it.count or 0 end
+local function allowChanged(name)
+  local l = lines[name]
+  l.rev = (l.rev or 0) + 1
+  save(); pushAllow(name)
+end
 
-local function label(it)
+local function sorted()
+  local names = {}
+  for name in pairs(lines) do names[#names + 1] = name end
+  table.sort(names)
+  return names
+end
+
+local function setLine(name, on)
+  local l = lines[name]
+  if not l then return end
+  l.desired = on
+  if l.id then rednet.send(l.id, { type = "set", name = name, on = on }, PROTO) end
+end
+
+local function setAll(on)
+  for name in pairs(lines) do setLine(name, on) end
+  save()
+end
+
+---------------------------------------------------------------- drawing
+local lastCount = -1
+
+local function findMonitor()
+  mon = peripheral.find("monitor")
+  lastCount = -1
+end
+
+-- Pick the largest text scale that still fits big touch tiles for every line
+local function fitMonitor(count)
+  if not mon then return end
+  for _, s in ipairs({ 1.5, 1, 0.5 }) do
+    mon.setTextScale(s)
+    local w, h = mon.getSize()
+    if (w >= 30 and count * 4 + 5 <= h) or s == 0.5 then return end
+  end
+end
+
+-- Tiles are 3 rows high on the monitor (if they fit), 1 row on the terminal
+local function layout(t, count)
+  local w, h = t.getSize()
+  local rowH = (t ~= term and count * 4 + 5 <= h) and 3 or 1
+  local step = rowH > 1 and rowH + 1 or 1
+  return w, h, rowH, step
+end
+
+local function fill(t, x, y, w, h, bg)
+  t.setBackgroundColor(bg)
+  local s = string.rep(" ", w)
+  for yy = y, y + h - 1 do t.setCursorPos(x, yy); t.write(s) end
+end
+
+local function status(l)
+  local online = l.seen and (os.clock() - l.seen) < TIMEOUT
+  if not online then return "OFFLINE", colors.lightGray
+  elseif l.actual ~= l.desired then return "SYNCING", colors.orange
+  elseif l.actual then return "RUNNING", colors.lime
+  else return "STOPPED", colors.red end
+end
+
+local function drawTo(t)
+  local names = sorted()
+  local w, h, rowH, step = layout(t, #names)
+  local tileBg = rowH > 1 and colors.gray or colors.black
+
+  t.setBackgroundColor(colors.black); t.clear()
+  fill(t, 1, 1, w, 1, colors.gray)
+  t.setCursorPos(2, 1); t.setTextColor(colors.white); t.write("FACTORY FUSEBOX")
+  local v = "v" .. VERSION
+  t.setCursorPos(w - #v, 1); t.setTextColor(colors.lightGray); t.write(v)
+
+  if t == term then
+    t.setBackgroundColor(colors.black); t.setTextColor(colors.gray); t.setCursorPos(1, 2)
+    t.write("1-9/ON=toggle name=items U=upd mon:" .. (mon and peripheral.getName(mon) or "none"))
+  end
+
+  if #names == 0 then
+    t.setBackgroundColor(colors.black); t.setTextColor(colors.gray)
+    t.setCursorPos(2, 3); t.write("Waiting for line terminals...")
+  end
+
+  for i, name in ipairs(names) do
+    local y = 3 + (i - 1) * step
+    if y + rowH - 1 > h - rowH - 1 then break end
+    local l = lines[name]
+    local st, col = status(l)
+    local mid = y + math.floor(rowH / 2)
+    local swBg = l.desired and colors.green or colors.red
+
+    fill(t, 1, y, w, rowH, tileBg)
+    fill(t, 1, y, 7, rowH, swBg)
+    t.setCursorPos(2, mid); t.setBackgroundColor(swBg); t.setTextColor(colors.white)
+    t.write(l.desired and " ON " or " OFF")
+    t.setBackgroundColor(tileBg); t.setCursorPos(9, mid)
+    local tag = l.allow and (" [" .. #l.allow .. " items]") or " [all]"
+    local room = math.max(1, w - #st - 11)
+    local txt = (i .. ". " .. name):sub(1, room)
+    t.write(txt)
+    if #txt + #tag <= room then t.setTextColor(colors.lightGray); t.write(tag) end
+    t.setCursorPos(w - #st, mid); t.setTextColor(col); t.write(st)
+  end
+
+  local by, half = h - rowH + 1, math.floor(w / 2)
+  local bm = by + math.floor(rowH / 2)
+  fill(t, 1, by, half - 1, rowH, colors.green)
+  fill(t, half + 1, by, w - half, rowH, colors.red)
+  t.setTextColor(colors.white)
+  t.setBackgroundColor(colors.green); t.setCursorPos(math.max(1, math.floor((half - 7) / 2) + 1), bm); t.write("ALL ON")
+  t.setBackgroundColor(colors.red); t.setCursorPos(half + math.max(1, math.floor((w - half - 7) / 2) + 1), bm); t.write("ALL OFF")
+  t.setBackgroundColor(colors.black)
+end
+
+local function draw()
+  local count = 0
+  for _ in pairs(lines) do count = count + 1 end
+  if count ~= lastCount then fitMonitor(count); lastCount = count end
+  drawTo(term)
+  if mon then drawTo(mon) end
+end
+
+local openEditor   -- defined below
+
+local function click(t, x, y)
+  local names = sorted()
+  local w, h, rowH, step = layout(t, #names)
+  if y >= h - rowH + 1 then setAll(x <= math.floor(w / 2)); return end
+  if y < 3 or (y - 3) % step >= rowH then return end
+  local name = names[math.floor((y - 3) / step) + 1]
+  if not name then return end
+  if t == term and x > 7 then openEditor(name); return end
+  setLine(name, not lines[name].desired); save()
+end
+
+---------------------------------------------------------------- allowlist editor
+-- Runs on the computer screen (needs a keyboard). The monitor keeps showing the panel.
+local view = "main"
+local ed = { name = nil, query = "", sel = 1, scroll = 0, rows = {}, me = {}, msg = "" }
+
+local bridge = peripheral.find("meBridge") or peripheral.find("me_bridge")
+
+local function itemLabel(it)
   local d = it.displayName or it.name
   return (d:gsub("^%[(.*)%]$", "%1"))
 end
 
-local function refreshItems()
-  local fn = bridge.listItems or bridge.getItems
-  if not fn then
-    msg, msgColor = "Bridge methods: " .. table.concat(peripheral.getMethods(peripheral.getName(bridge)), ","), colors.red
-    return
-  end
-  local ok, list, err
-  if bridge.listItems then ok, list, err = pcall(fn) else ok, list, err = pcall(fn, {}) end
-  if not ok or type(list) ~= "table" then
-    msg, msgColor = "ME read failed: " .. tostring(ok and err or list), colors.red
-    return
-  end
-  items = list
-  table.sort(items, function(a, b) return label(a):lower() < label(b):lower() end)
+local function globToPattern(g)
+  return "^" .. g:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
 end
 
-local function applyFilter()
-  filtered = {}
-  local q = query:lower()
-  for _, it in ipairs(items) do
-    if q == "" or label(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true) then
-      filtered[#filtered + 1] = it
+local function covered(allow, id)
+  if not allow then return true end
+  for _, a in ipairs(allow) do
+    if a == id or (a:find("*", 1, true) and id:find(globToPattern(a))) then return true end
+  end
+  return false
+end
+
+local function loadME()
+  ed.me = {}
+  if not bridge then ed.msg = "No ME Bridge on network - type item ids manually"; return end
+  local ok, list
+  if bridge.listItems then ok, list = pcall(bridge.listItems) else ok, list = pcall(bridge.getItems, {}) end
+  if not ok or type(list) ~= "table" then ed.msg = "ME read failed: " .. tostring(list); return end
+  ed.me = list
+  table.sort(ed.me, function(a, b) return itemLabel(a):lower() < itemLabel(b):lower() end)
+  ed.msg = #ed.me .. " item types in ME"
+end
+
+local function buildRows()
+  local l, q = lines[ed.name], ed.query:lower()
+  local rows, exact = {}, {}
+  if l.allow then
+    for _, a in ipairs(l.allow) do exact[a] = true end
+  end
+  if q ~= "" and not exact[ed.query] then
+    rows[#rows + 1] = { kind = "add", id = ed.query }
+  end
+  if l.allow then
+    local sortedAllow = { table.unpack(l.allow) }
+    table.sort(sortedAllow)
+    for _, a in ipairs(sortedAllow) do
+      if q == "" or a:lower():find(q, 1, true) then rows[#rows + 1] = { kind = "entry", id = a } end
     end
   end
-  sel = math.max(1, math.min(sel, #filtered))
-end
-
--- Export in a loop: the bridge may move less than requested per call
-local function export(name, count)
-  local moved = 0
-  while moved < count do
-    local req = { name = name, count = count - moved }
-    local ok, n, err
-    if SIDES[cfg.chest] then
-      ok, n, err = pcall(bridge.exportItem, req, cfg.chest)
-    elseif bridge.exportItemToPeripheral then
-      ok, n, err = pcall(bridge.exportItemToPeripheral, req, cfg.chest)
-    else
-      ok, n, err = pcall(bridge.exportItem, req, cfg.chest)
+  for _, it in ipairs(ed.me) do
+    if not exact[it.name] and (q == "" or itemLabel(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true)) then
+      rows[#rows + 1] = { kind = "item", id = it.name, label = itemLabel(it) }
     end
-    if not ok then return moved, n end
-    if type(n) ~= "number" or n <= 0 then return moved, err end
-    moved = moved + n
   end
-  return moved
+  ed.rows = rows
+  ed.sel = math.max(1, math.min(ed.sel, #rows))
 end
 
----------------------------------------------------------------- UI
-local w, h = term.getSize()
-local listTop, listBottom = 4, h - 2
+openEditor = function(name)
+  view, ed.name, ed.query, ed.sel, ed.scroll = "edit", name, "", 1, 0
+  loadME(); buildRows()
+end
 
-local function draw()
-  term.setBackgroundColor(colors.black); term.clear()
+local function addAllow(id)
+  local l = lines[ed.name]
+  l.allow = l.allow or {}
+  for _, a in ipairs(l.allow) do if a == id then return end end
+  l.allow[#l.allow + 1] = id
+  allowChanged(ed.name)
+end
 
-  -- header
-  term.setCursorPos(1, 1)
-  term.setBackgroundColor(colors.gray); term.setTextColor(colors.white)
-  term.clearLine(); term.write(" " .. cfg.name)
-  term.setTextColor(colors.lightGray); term.write("  v" .. VERSION)
-  local st = cfg.on and " RUNNING " or " STOPPED "
-  term.setCursorPos(w - #st + 1, 1)
-  term.setBackgroundColor(cfg.on and colors.green or colors.red)
-  term.write(st)
+local function removeAllow(id)
+  local l = lines[ed.name]
+  if not l.allow then return end
+  for i, a in ipairs(l.allow) do
+    if a == id then table.remove(l.allow, i); allowChanged(ed.name); return end
+  end
+end
 
-  -- search bar
-  term.setBackgroundColor(colors.black)
-  term.setCursorPos(1, 2); term.setTextColor(colors.yellow); term.write("Search: ")
-  term.setTextColor(colors.white); term.write(query)
-  term.setCursorPos(1, 3); term.setTextColor(colors.gray); term.write(string.rep("-", w))
+local function toggleMode()
+  local l = lines[ed.name]
+  if l.allow then l.backup, l.allow = l.allow, nil
+  else l.allow, l.backup = l.backup or {}, nil end
+  allowChanged(ed.name); buildRows()
+end
 
-  -- item list
-  local rows = listBottom - listTop + 1
-  if sel < scroll + 1 then scroll = sel - 1 end
-  if sel > scroll + rows then scroll = sel - rows end
+local function activate(i)
+  local r = ed.rows[i]
+  if not r then return end
+  if r.kind == "add" then addAllow(r.id); ed.query = ""
+  elseif r.kind == "entry" then removeAllow(r.id)
+  elseif r.kind == "item" then addAllow(r.id); ed.query = "" end
+  buildRows()
+end
+
+local function edLayout()
+  local w, h = term.getSize()
+  return w, h, 5, h - 1
+end
+
+local function drawEditor()
+  local t = term
+  local w, h, top, bottom = edLayout()
+  local l = lines[ed.name]
+  t.setBackgroundColor(colors.black); t.clear()
+
+  fill(t, 1, 1, w, 1, colors.gray)
+  t.setCursorPos(2, 1); t.setTextColor(colors.white); t.write(("Allowed items: " .. ed.name):sub(1, w - 9))
+  t.setCursorPos(w - 6, 1); t.setBackgroundColor(colors.red); t.write(" Back ")
+
+  t.setCursorPos(1, 2); t.setBackgroundColor(l.allow and colors.orange or colors.green); t.setTextColor(colors.white)
+  t.write(l.allow and (" WHITELIST: " .. #l.allow .. " ") or " ALL ITEMS ALLOWED ")
+  t.setBackgroundColor(colors.black); t.setTextColor(colors.gray); t.write(" Tab/click=switch")
+
+  t.setCursorPos(1, 3); t.setTextColor(colors.yellow); t.write("Search/add: ")
+  t.setTextColor(colors.white); t.write(ed.query)
+  t.setCursorPos(1, 4); t.setTextColor(colors.gray); t.write(string.rep("-", w))
+
+  local rows = bottom - top + 1
+  if ed.sel < ed.scroll + 1 then ed.scroll = ed.sel - 1 end
+  if ed.sel > ed.scroll + rows then ed.scroll = ed.sel - rows end
   for i = 1, rows do
-    local it = filtered[scroll + i]
-    if not it then break end
-    local y = listTop + i - 1
-    term.setCursorPos(1, y)
-    term.setBackgroundColor(scroll + i == sel and colors.blue or colors.black)
-    term.setTextColor(colors.white); term.clearLine()
-    local cnt = tostring(amountOf(it))
-    term.write(" " .. label(it):sub(1, w - #cnt - 3))
-    term.setCursorPos(w - #cnt, y); term.setTextColor(colors.lightGray); term.write(cnt)
+    local idx = ed.scroll + i
+    local r = ed.rows[idx]
+    if not r then break end
+    local y = top + i - 1
+    t.setCursorPos(1, y)
+    t.setBackgroundColor(idx == ed.sel and colors.blue or colors.black); t.clearLine()
+    if r.kind == "add" then
+      t.setTextColor(colors.lime); t.write((" + add \"" .. r.id .. "\"" .. (r.id:find("*", 1, true) and " (pattern)" or "")):sub(1, w))
+    elseif r.kind == "entry" then
+      t.setTextColor(colors.lime); t.write(" [x] ")
+      t.setTextColor(colors.white); t.write(r.id:sub(1, w - 5))
+    else
+      local on = covered(l.allow, r.id)
+      t.setTextColor(on and colors.lime or colors.gray); t.write(on and (l.allow and " [*] " or " [ ] ") or " [ ] ")
+      t.setTextColor(colors.white); t.write(r.label:sub(1, w - 6))
+      local id = r.id
+      if 6 + #r.label + #id + 2 <= w then t.setCursorPos(w - #id, y); t.setTextColor(colors.gray); t.write(id) end
+    end
   end
-  if #filtered == 0 then
-    term.setCursorPos(2, listTop); term.setTextColor(colors.gray); term.write("No items")
+  if #ed.rows == 0 then
+    t.setCursorPos(2, top); t.setTextColor(colors.gray); t.write("Type an item id or pattern, e.g. create:*")
   end
 
-  -- status / amount prompt
-  term.setBackgroundColor(colors.black)
-  term.setCursorPos(1, h - 1)
-  if mode == "amount" then
-    term.setTextColor(colors.yellow); term.write("Amount of " .. label(filtered[sel]) .. ": ")
-    term.setTextColor(colors.white); term.write(amountStr)
-  else
-    term.setTextColor(msgColor); term.write(msg:sub(1, w))
-  end
-  term.setCursorPos(1, h); term.setTextColor(colors.gray)
-  term.write(mode == "amount" and "Enter=send  Bksp on empty=cancel"
-                               or "Type=search Enter=request F5=refresh F9=update")
-end
-
-local function doRequest()
-  local n, it = tonumber(amountStr), filtered[sel]
-  mode = "browse"
-  if not (n and n > 0 and it) then msg, msgColor = "Cancelled", colors.lightGray; return end
-  local moved, err = export(it.name, n)
-  if moved == n then
-    msg, msgColor = "Sent " .. moved .. "x " .. label(it), colors.lime
-  else
-    msg, msgColor = "Sent " .. moved .. "/" .. n .. (err and (" - " .. tostring(err)) or " (chest full?)"), colors.orange
-  end
-  refreshItems(); applyFilter()
+  t.setBackgroundColor(colors.black); t.setCursorPos(1, h); t.setTextColor(colors.gray)
+  t.write(("Enter/click=toggle F5=reload F1=back  " .. ed.msg):sub(1, w))
 end
 
 ---------------------------------------------------------------- main loop
-applyState()
-refreshItems(); applyFilter()
-sendStatus()
-local hbTimer = os.startTimer(HEARTBEAT)
-local rfTimer = os.startTimer(REFRESH)
-draw()
+load()
+findMonitor()
+local tick = os.startTimer(1)
+
+local function drawAll()
+  if view == "edit" then
+    if mon then
+      local count = 0
+      for _ in pairs(lines) do count = count + 1 end
+      if count ~= lastCount then fitMonitor(count); lastCount = count end
+      drawTo(mon)
+    end
+    drawEditor()
+  else
+    draw()
+  end
+end
+
+drawAll()
 
 local relaunch = false
 while not relaunch do
@@ -277,61 +393,74 @@ while not relaunch do
   local e = ev[1]
 
   if e == "rednet_message" and ev[4] == PROTO then
-    local m = ev[3]
-    if type(m) == "table" and m.type == "set" and m.name == cfg.name and m.on ~= cfg.on then
-      cfg.on = m.on; saveCfg(cfg); applyState(); sendStatus()
-      msg, msgColor = "Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange
-    end
-
-  elseif e == "timer" then
-    if ev[2] == hbTimer then
-      sendStatus(); hbTimer = os.startTimer(HEARTBEAT)
-    elseif ev[2] == rfTimer then
-      if mode == "browse" then refreshItems(); applyFilter() end
-      rfTimer = os.startTimer(REFRESH)
-    end
-
-  elseif e == "char" then
-    if mode == "browse" then
-      query = query .. ev[2]; sel = 1; applyFilter()
-    elseif ev[2]:match("%d") and #amountStr < 6 then
-      amountStr = amountStr .. ev[2]
-    end
-
-  elseif e == "key" then
-    local k = ev[2]
-    if mode == "browse" then
-      if k == keys.backspace then query = query:sub(1, -2); sel = 1; applyFilter()
-      elseif k == keys.up then sel = math.max(1, sel - 1)
-      elseif k == keys.down then sel = math.max(1, math.min(#filtered, sel + 1))
-      elseif k == keys.f5 then refreshItems(); applyFilter(); msg, msgColor = "Refreshed", colors.lightGray
-      elseif k == keys.f9 then
-        relaunch = checkUpdate()
-        if not relaunch then msg, msgColor = "Already on latest (v" .. VERSION .. ")", colors.lightGray end
-      elseif (k == keys.enter or k == keys.numPadEnter) and filtered[sel] then mode, amountStr = "amount", ""
+    local sender, m = ev[2], ev[3]
+    if type(m) == "table" and m.type == "status" and m.name then
+      local l = lines[m.name]
+      if not l then
+        -- new line: adopt the state and allowlist it reports
+        l = { desired = m.on, allow = m.allow, rev = m.rev or 0 }
+        lines[m.name] = l
+        save()
       end
-    else
-      if k == keys.backspace then
-        if amountStr == "" then mode = "browse" else amountStr = amountStr:sub(1, -2) end
-      elseif k == keys.enter or k == keys.numPadEnter then
-        doRequest()
+      l.id, l.actual, l.seen = sender, m.on, os.clock()
+      if l.desired ~= l.actual then
+        rednet.send(sender, { type = "set", name = m.name, on = l.desired }, PROTO)
       end
+      if (m.rev or 0) ~= (l.rev or 0) then pushAllow(m.name) end
     end
 
-  elseif e == "mouse_click" and mode == "browse" then
-    local y = ev[4]
-    if y >= listTop and y <= listBottom then
-      local idx = scroll + (y - listTop + 1)
-      if filtered[idx] then
-        if idx == sel then mode, amountStr = "amount", "" else sel = idx end
-      end
+  elseif e == "timer" and ev[2] == tick then
+    tick = os.startTimer(1)
+
+  elseif e == "monitor_touch" and mon and ev[2] == peripheral.getName(mon) then
+    click(mon, ev[3], ev[4])
+
+  elseif e == "peripheral" or e == "peripheral_detach" then
+    findMonitor()
+    bridge = peripheral.find("meBridge") or peripheral.find("me_bridge")
+
+  elseif e == "monitor_resize" then
+    lastCount = -1
+
+  elseif view == "main" then
+    if e == "mouse_click" then
+      click(term, ev[3], ev[4])
+    elseif e == "char" and ev[2] == "u" then
+      relaunch = checkUpdate()
+    elseif e == "char" then
+      local n = tonumber(ev[2])
+      local name = n and sorted()[n]
+      if name then setLine(name, not lines[name].desired); save() end
     end
 
-  elseif e == "mouse_scroll" and mode == "browse" then
-    sel = math.max(1, math.min(#filtered, sel + ev[2]))
+  else -- editor
+    local w, h, top, bottom = edLayout()
+    if e == "char" then
+      ed.query = ed.query .. ev[2]; ed.sel = 1; buildRows()
+    elseif e == "key" then
+      local k = ev[2]
+      if k == keys.backspace then ed.query = ed.query:sub(1, -2); ed.sel = 1; buildRows()
+      elseif k == keys.up then ed.sel = math.max(1, ed.sel - 1)
+      elseif k == keys.down then ed.sel = math.max(1, math.min(#ed.rows, ed.sel + 1))
+      elseif k == keys.enter or k == keys.numPadEnter then activate(ed.sel)
+      elseif k == keys.tab then toggleMode()
+      elseif k == keys.f5 then loadME(); buildRows()
+      elseif k == keys.f1 then view = "main"
+      end
+    elseif e == "mouse_click" then
+      local x, y = ev[3], ev[4]
+      if y == 1 and x >= w - 6 then view = "main"
+      elseif y == 2 then toggleMode()
+      elseif y >= top and y <= bottom then
+        local idx = ed.scroll + (y - top + 1)
+        if ed.rows[idx] then ed.sel = idx; activate(idx) end
+      end
+    elseif e == "mouse_scroll" then
+      ed.sel = math.max(1, math.min(#ed.rows, ed.sel + ev[2]))
+    end
   end
 
-  draw()
+  drawAll()
 end
 
 shell.run(shell.getRunningProgram())
