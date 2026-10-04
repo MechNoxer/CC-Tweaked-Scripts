@@ -2,7 +2,7 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
-local VERSION   = "1.3.0"
+local VERSION   = "1.4.0"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -94,13 +94,47 @@ local function pickChest()
   end
 end
 
+local RELAY_TYPES = { "redstone_relay", "redstoneIntegrator" }
+
+local function networkRelays()
+  local list = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    for _, t in ipairs(RELAY_TYPES) do
+      if peripheral.hasType(n, t) then list[#list + 1] = n; break end
+    end
+  end
+  table.sort(list)
+  return list
+end
+
+local function askSide(prompt, default)
+  while true do
+    local s = ask(prompt .. " (top/bottom/left/right/front/back)", default)
+    if SIDES[s] then return s end
+    print("Not a valid side.")
+  end
+end
+
+-- Clutch output: a Redstone Relay on the network, or this computer's own side
+local function pickClutch(c)
+  local relays = networkRelays()
+  print("Clutch redstone output:")
+  print("  0) this computer")
+  for i, n in ipairs(relays) do print(("  %d) %s"):format(i, n)) end
+  local i
+  repeat i = tonumber(ask("Choice", #relays > 0 and "1" or "0")) until i and (i == 0 or relays[i])
+  c.clutchRelay = relays[i]   -- nil when 0
+  c.clutchSide = askSide(c.clutchRelay and "Relay side facing the clutch" or "Computer side facing the clutch", "back")
+  c.clutchSetup = true
+end
+
 local function setup()
   term.clear(); term.setCursorPos(1, 1)
   print("== Production line setup ==")
   local c = {}
   repeat c.name = ask("Line name (unique)") until c.name
   c.chest = pickChest()
-  c.clutchSide = ask("Clutch redstone side", "back")
+  pickClutch(c)
   c.stopWhenPowered = ask("Clutch stops line when powered? (y/n)", "y"):lower() == "y"
   c.on = false
   saveCfg(c)
@@ -114,6 +148,13 @@ if SIDES[cfg.chest] or not peripheral.isPresent(cfg.chest) then
   cfg.chest = pickChest()
   saveCfg(cfg)
 end
+-- configs from before relay support: ask once where the clutch is
+if not cfg.clutchSetup then
+  term.clear(); term.setCursorPos(1, 1)
+  print("Clutch output setup (new: Redstone Relay support)")
+  pickClutch(cfg)
+  saveCfg(cfg)
+end
 
 ---------------------------------------------------------------- peripherals
 local bridge = peripheral.find("meBridge") or peripheral.find("me_bridge")
@@ -124,10 +165,19 @@ if not modem then error("No wired modem found", 0) end
 rednet.open(peripheral.getName(modem))
 
 ---------------------------------------------------------------- line state
+local clutchOk = true
+
 local function applyState()
   local powered = cfg.on
   if cfg.stopWhenPowered then powered = not cfg.on end
-  redstone.setOutput(cfg.clutchSide, powered)
+  local out = redstone
+  if cfg.clutchRelay then out = peripheral.wrap(cfg.clutchRelay) end
+  if out then
+    out.setOutput(cfg.clutchSide, powered)
+    clutchOk = true
+  else
+    clutchOk = false   -- relay missing; retried every heartbeat
+  end
 end
 
 local function sendStatus()
@@ -231,9 +281,9 @@ local function draw()
   term.setBackgroundColor(colors.gray); term.setTextColor(colors.white)
   term.clearLine(); term.write(" " .. cfg.name)
   term.setTextColor(colors.lightGray); term.write("  v" .. VERSION)
-  local st = cfg.on and " RUNNING " or " STOPPED "
+  local st = (not clutchOk) and " NO RELAY " or (cfg.on and " RUNNING " or " STOPPED ")
   term.setCursorPos(w - #st + 1, 1)
-  term.setBackgroundColor(cfg.on and colors.green or colors.red)
+  term.setBackgroundColor((not clutchOk) and colors.orange or (cfg.on and colors.green or colors.red))
   term.write(st)
 
   -- search bar
@@ -317,7 +367,7 @@ while not relaunch do
 
   elseif e == "timer" then
     if ev[2] == hbTimer then
-      sendStatus(); hbTimer = os.startTimer(HEARTBEAT)
+      applyState(); sendStatus(); hbTimer = os.startTimer(HEARTBEAT)
     elseif ev[2] == rfTimer then
       if mode == "browse" then refreshItems(); applyFilter() end
       rfTimer = os.startTimer(REFRESH)
