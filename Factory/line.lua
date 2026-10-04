@@ -3,7 +3,7 @@
 -- Runs jobs given by the fusebox: fills the input chest from ME, runs the line,
 -- drains the buffer chest to ME or directly into the next line's input chest.
 
-local VERSION    = "2.0.1"
+local VERSION    = "2.0.2"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -206,35 +206,79 @@ local function isAllowed(id, lbl)
 end
 
 ---------------------------------------------------------------- ME access
--- Advanced Peripherals renamed these between versions; try both forms.
-local function export(name, count, target)
-  local moved = 0
-  while moved < count do
-    local req = { name = name, count = count - moved }
-    local ok, n, err
-    if bridge.exportItemToPeripheral then
-      ok, n, err = pcall(bridge.exportItemToPeripheral, req, target)
-    else
-      ok, n, err = pcall(bridge.exportItem, req, target)
+-- Advanced Peripherals changed the bridge API between versions:
+--   0.7: exportItem(filter, target) / importItem(filter, source) -> number
+--   0.8: exportItem(target, filter) / importItem(source, filter) -> table | nil, err
+-- So we try the known call forms; the moved count comes from the return value,
+-- or from counting the chest when the return value doesn't tell.
+local VARIANTS = {
+  export = { { "exportItemToPeripheral", false }, { "exportItem", false }, { "exportItem", true } },
+  import = { { "importItemFromPeripheral", false }, { "importItem", false }, { "importItem", true } },
+}
+local working = {}   -- kind -> index of the call form that moved items
+
+local function countItem(chest, name)
+  local p = peripheral.wrap(chest)
+  if not p then return nil end
+  local ok, l = pcall(p.list)
+  if not ok or type(l) ~= "table" then return nil end
+  local n = 0
+  for _, it in pairs(l) do if it.name == name then n = n + it.count end end
+  return n
+end
+
+-- one bridge call; returns moved count (measured), error text
+local function bridgeMove(kind, name, count, chest)
+  local before = countItem(chest, name)
+  if not before then return 0, "chest " .. chest .. " not found" end
+  local list = VARIANTS[kind]
+  local firstErr
+  local from, to = 1, #list
+  if working[kind] then from, to = working[kind], working[kind] end
+  for i = from, to do
+    local fn, targetFirst = bridge[list[i][1]], list[i][2]
+    if fn then
+      local filter = { name = name, count = count }
+      local ok, r, err
+      if targetFirst then ok, r, err = pcall(fn, chest, filter) else ok, r, err = pcall(fn, filter, chest) end
+      -- prefer the count the bridge reports; only measure the chest if it doesn't say
+      local moved
+      if ok and type(r) == "number" then moved = r
+      elseif ok and type(r) == "table" and type(r.count or r.amount) == "number" then moved = r.count or r.amount
+      else
+        local after = countItem(chest, name) or before
+        moved = (kind == "export") and (after - before) or (before - after)
+      end
+      if moved > 0 then
+        working[kind] = i
+        return moved
+      end
+      firstErr = firstErr or (not ok and tostring(r)) or (err and tostring(err)) or (r == nil and "nothing moved") or nil
     end
-    if not ok then return moved, n end
-    if type(n) ~= "number" or n <= 0 then return moved, err end
+  end
+  return 0, firstErr
+end
+
+local function export(name, count, target)
+  local moved, err = 0, nil
+  while moved < count do
+    local n
+    n, err = bridgeMove("export", name, count - moved, target)
+    if n <= 0 then break end
     moved = moved + n
   end
-  return moved
+  return moved, err
 end
 
 local function import(name, count, source)
-  local req = { name = name, count = count }
-  local ok, n, err
-  if bridge.importItemFromPeripheral then
-    ok, n, err = pcall(bridge.importItemFromPeripheral, req, source)
-  else
-    ok, n, err = pcall(bridge.importItem, req, source)
+  local moved, err = 0, nil
+  while moved < count do
+    local n
+    n, err = bridgeMove("import", name, count - moved, source)
+    if n <= 0 then break end
+    moved = moved + n
   end
-  if not ok then return 0, n end
-  if type(n) ~= "number" then return 0, err end
-  return n, err
+  return moved, err
 end
 
 -- nil when unknown
@@ -350,7 +394,8 @@ local function stepJob()
     for _, i in ipairs(j.inputs) do
       local rem = i.count - (i.loaded or 0)
       if rem > 0 and not i.short then
-        local moved = export(i.name, rem, cfg.inputChest)
+        local moved, err = export(i.name, rem, cfg.inputChest)
+        if moved == 0 and meCount(i.name) ~= 0 then j.warn = "can't export from ME (input chest full?): " .. tostring(err or "") end
         if moved > 0 then
           i.loaded = (i.loaded or 0) + moved
           activity, changed = now, true
@@ -362,21 +407,30 @@ local function stepJob()
     end
   end
 
-  -- 2) drain buffer: job output -> destination, everything else -> ME
+  -- 2) drain buffer: job output -> next line (per slot), everything else -> ME (per item type)
+  local toME = {}
   for slot, it in pairs(bufL) do
     local isOutput = (j.output == nil or it.name == j.output)
-    local moved = 0
     if isOutput and type(j.dest) == "table" then
       local ok, n = pcall(buf.pushItems, j.dest.chest, slot)
-      moved = (ok and type(n) == "number") and n or 0
-      if moved == 0 then j.warn = "can't push to " .. j.dest.line .. " (chest full/missing)" end
+      local moved = (ok and type(n) == "number") and n or 0
+      if moved > 0 then
+        activity, changed = now, true
+        j.produced = (j.produced or 0) + moved
+      else
+        j.warn = "can't push to " .. j.dest.line .. " (chest full/missing)"
+      end
     else
-      moved = import(it.name, it.count, cfg.bufferChest)
-      if moved == 0 then j.warn = "can't import buffer into ME" end
+      toME[it.name] = (toME[it.name] or 0) + it.count
     end
+  end
+  for name, count in pairs(toME) do
+    local moved, err = import(name, count, cfg.bufferChest)
     if moved > 0 then
       activity, changed = now, true
-      if isOutput then j.produced = (j.produced or 0) + moved end
+      if j.output == nil or name == j.output then j.produced = (j.produced or 0) + moved end
+    else
+      j.warn = "can't import into ME: " .. tostring(err or "?")
     end
   end
 
