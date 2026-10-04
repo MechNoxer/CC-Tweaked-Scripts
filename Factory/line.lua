@@ -2,7 +2,7 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
-local VERSION   = "1.1.1"
+local VERSION   = "1.2.0"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -131,7 +131,22 @@ local function applyState()
 end
 
 local function sendStatus()
-  rednet.broadcast({ type = "status", name = cfg.name, on = cfg.on }, PROTO)
+  rednet.broadcast({ type = "status", name = cfg.name, on = cfg.on, rev = cfg.allowRev or 0, allow = cfg.allow }, PROTO)
+end
+
+---------------------------------------------------------------- allowlist
+-- cfg.allow == nil  -> every item allowed
+-- cfg.allow == {..} -> only these item ids / patterns ("create:*", "*_ingot")
+local function globToPattern(g)
+  return "^" .. g:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%0"):gsub("%*", ".*") .. "$"
+end
+
+local function isAllowed(id)
+  if cfg.allow == nil then return true end
+  for _, a in ipairs(cfg.allow) do
+    if a == id or (a:find("*", 1, true) and id:find(globToPattern(a))) then return true end
+  end
+  return false
 end
 
 ---------------------------------------------------------------- ME access
@@ -167,7 +182,7 @@ local function applyFilter()
   filtered = {}
   local q = query:lower()
   for _, it in ipairs(items) do
-    if q == "" or label(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true) then
+    if isAllowed(it.name) and (q == "" or label(it):lower():find(q, 1, true) or it.name:lower():find(q, 1, true)) then
       filtered[#filtered + 1] = it
     end
   end
@@ -233,7 +248,8 @@ local function draw()
     term.setCursorPos(w - #cnt, y); term.setTextColor(colors.lightGray); term.write(cnt)
   end
   if #filtered == 0 then
-    term.setCursorPos(2, listTop); term.setTextColor(colors.gray); term.write("No items")
+    term.setCursorPos(2, listTop); term.setTextColor(colors.gray)
+    term.write((cfg.allow and #cfg.allow == 0) and "No items allowed - set them on the fusebox" or "No items")
   end
 
   -- status / amount prompt
@@ -254,6 +270,7 @@ local function doRequest()
   local n, it = tonumber(amountStr), filtered[sel]
   mode = "browse"
   if not (n and n > 0 and it) then msg, msgColor = "Cancelled", colors.lightGray; return end
+  if not isAllowed(it.name) then msg, msgColor = "Not allowed on this line", colors.red; return end
   local moved, err = export(it.name, n)
   if moved == n then
     msg, msgColor = "Sent " .. moved .. "x " .. label(it), colors.lime
@@ -281,6 +298,11 @@ while not relaunch do
     if type(m) == "table" and m.type == "set" and m.name == cfg.name and m.on ~= cfg.on then
       cfg.on = m.on; saveCfg(cfg); applyState(); sendStatus()
       msg, msgColor = "Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange
+    elseif type(m) == "table" and m.type == "allow" and m.name == cfg.name then
+      cfg.allow, cfg.allowRev = m.allow, m.rev; saveCfg(cfg)
+      if mode == "amount" and filtered[sel] and not isAllowed(filtered[sel].name) then mode = "browse" end
+      applyFilter(); sendStatus()
+      msg, msgColor = "Allowed items updated by fusebox", colors.orange
     end
 
   elseif e == "timer" then
