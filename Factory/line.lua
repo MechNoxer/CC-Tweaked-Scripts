@@ -2,7 +2,7 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
-local VERSION   = "1.4.0"
+local VERSION   = "1.4.1"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -109,8 +109,8 @@ end
 
 local function askSide(prompt, default)
   while true do
-    local s = ask(prompt .. " (top/bottom/left/right/front/back)", default)
-    if SIDES[s] then return s end
+    local s = ask(prompt .. " (all/top/bottom/left/right/front/back)", default)
+    if s == "all" or SIDES[s] then return s end
     print("Not a valid side.")
   end
 end
@@ -124,7 +124,13 @@ local function pickClutch(c)
   local i
   repeat i = tonumber(ask("Choice", #relays > 0 and "1" or "0")) until i and (i == 0 or relays[i])
   c.clutchRelay = relays[i]   -- nil when 0
-  c.clutchSide = askSide(c.clutchRelay and "Relay side facing the clutch" or "Computer side facing the clutch", "back")
+  if c.clutchRelay then
+    print("Tip: 'all' powers every side of the relay,")
+    print("so you don't need to know which side faces the clutch.")
+    c.clutchSide = askSide("Relay side", "all")
+  else
+    c.clutchSide = askSide("Computer side facing the clutch", "back")
+  end
   c.clutchSetup = true
 end
 
@@ -173,7 +179,11 @@ local function applyState()
   local out = redstone
   if cfg.clutchRelay then out = peripheral.wrap(cfg.clutchRelay) end
   if out then
-    out.setOutput(cfg.clutchSide, powered)
+    if cfg.clutchSide == "all" then
+      for side in pairs(SIDES) do out.setOutput(side, powered) end
+    else
+      out.setOutput(cfg.clutchSide, powered)
+    end
     clutchOk = true
   else
     clutchOk = false   -- relay missing; retried every heartbeat
