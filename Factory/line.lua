@@ -2,7 +2,7 @@
 -- CC:Tweaked + Advanced Peripherals ME Bridge + Create clutch
 -- Pulls items from ME into this line's chest, obeys the fusebox.
 
-local VERSION   = "1.4.1"
+local VERSION   = "1.4.2"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -124,14 +124,10 @@ local function pickClutch(c)
   local i
   repeat i = tonumber(ask("Choice", #relays > 0 and "1" or "0")) until i and (i == 0 or relays[i])
   c.clutchRelay = relays[i]   -- nil when 0
-  if c.clutchRelay then
-    print("Tip: 'all' powers every side of the relay,")
-    print("so you don't need to know which side faces the clutch.")
-    c.clutchSide = askSide("Relay side", "all")
-  else
-    c.clutchSide = askSide("Computer side facing the clutch", "back")
-  end
-  c.clutchSetup = true
+  print("Side to power. 'all' = every side, so you")
+  print("don't need to know which side faces the clutch.")
+  c.clutchSide = askSide(c.clutchRelay and "Relay side" or "Computer side", "all")
+  c.clutchSetup = 2
 end
 
 local function setup()
@@ -155,7 +151,7 @@ if SIDES[cfg.chest] or not peripheral.isPresent(cfg.chest) then
   saveCfg(cfg)
 end
 -- configs from before relay support: ask once where the clutch is
-if not cfg.clutchSetup then
+if cfg.clutchSetup ~= 2 then
   term.clear(); term.setCursorPos(1, 1)
   print("Clutch output setup (new: Redstone Relay support)")
   pickClutch(cfg)
