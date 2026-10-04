@@ -3,7 +3,7 @@
 -- Runs jobs given by the fusebox: fills the input chest from ME, runs the line,
 -- drains the buffer chest to ME or directly into the next line's input chest.
 
-local VERSION    = "2.0.0"
+local VERSION    = "2.0.1"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -407,6 +407,7 @@ end
 
 ---------------------------------------------------------------- UI
 local w, h = term.getSize()
+local chestCounts = { input = "?", buffer = "?" }
 
 local function short(id)
   return (id or "?"):gsub("^[^:]*:", ""):gsub("_", " ")
@@ -461,9 +462,9 @@ local function draw()
   end
 
   y = y + 1
-  local inL, bufL = list(cfg.inputChest), list(cfg.bufferChest)
-  line("In:     ", cfg.inputChest .. "  (" .. (inL and countIn(inL) or "?") .. " items)", colors.lightGray)
-  line("Buffer: ", cfg.bufferChest .. "  (" .. (bufL and countIn(bufL) or "?") .. " items)", colors.lightGray)
+  -- counts come from the job loop (no peripheral calls while drawing)
+  line("In:     ", cfg.inputChest .. "  (" .. chestCounts.input .. " items)", colors.lightGray)
+  line("Buffer: ", cfg.bufferChest .. "  (" .. chestCounts.buffer .. " items)", colors.lightGray)
   line("Clutch: ", (cfg.clutchRelay or "computer") .. " / " .. cfg.clutchSide, colors.lightGray)
 
   y = y + 1
@@ -477,78 +478,93 @@ local function draw()
 end
 
 ---------------------------------------------------------------- main loop
-applyState()
-sendStatus()
-local hbTimer = os.startTimer(HEARTBEAT)
-local tickTimer = os.startTimer(TICK)
-log("Line server started", colors.lightGray)
-draw()
-
+-- Three loops run side by side. Chest / ME calls make a coroutine wait for an
+-- internal event and drop everything else meanwhile, so the heartbeat and the
+-- job work each get their own loop and can never swallow each other's timers.
 local relaunch = false
-while not relaunch do
-  local ev = { os.pullEvent() }
-  local e = ev[1]
+local function redraw() os.queueEvent("line_redraw") end
 
-  if e == "rednet_message" and ev[4] == PROTO then
-    local m = ev[3]
-    if type(m) == "table" and m.name == cfg.name then
-      if m.type == "set" and m.on ~= cfg.on then
-        cfg.on = m.on; saveCfg(cfg); applyState(); sendStatus()
-        log("Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange)
-
-      elseif m.type == "allow" then
-        cfg.allow, cfg.allowRev = m.allow, m.rev; saveCfg(cfg); sendStatus()
-        log("Allowed items updated", colors.orange)
-
-      elseif m.type == "job" then
-        local cur, new = cfg.job, m.job
-        if new == nil then
-          if cur then cfg.job = nil; saveCfg(cfg); log("Job #" .. cur.id .. " closed", colors.lightGray) end
-        elseif not cur or cur.id ~= new.id then
-          -- refuse inputs this line isn't allowed to take
-          local bad
-          for _, i in ipairs(new.inputs or {}) do
-            if not isAllowed(i.name) then bad = i.name end
-          end
-          new.inputs = new.inputs or {}
-          new.state, new.produced = "running", 0
-          if bad then new.state, new.warn = "done", "input not allowed: " .. bad end
-          cfg.job = new; saveCfg(cfg)
-          activity, lastInputTotal = os.clock(), -1
-          log("New job #" .. new.id .. (bad and " REFUSED (not allowed)" or ""), bad and colors.red or colors.lime)
-        else
-          -- same job: take over flags the fusebox may change later
-          cur.upstreamDone, cur.dest = new.upstreamDone, new.dest
-          saveCfg(cfg)
-        end
-        applyState(); sendStatus()
-
-      elseif m.type == "cancel" and cfg.job and cfg.job.id == m.id and cfg.job.state ~= "done" then
-        cfg.job.state = "cancel"; saveCfg(cfg); applyState(); sendStatus()
-      end
-    end
-
-  elseif e == "timer" then
-    if ev[2] == hbTimer then
-      sendStatus(); hbTimer = os.startTimer(HEARTBEAT)
-    elseif ev[2] == tickTimer then
-      if stepJob() then saveCfg(cfg) end
-      applyState()
-      tickTimer = os.startTimer(TICK)
-    end
-
-  elseif e == "key" then
-    if ev[2] == keys.f9 then
-      relaunch = checkUpdate()
-    elseif ev[2] == keys.f2 then
-      cfg.reconfigure = true; saveCfg(cfg); relaunch = true
-    end
-
-  elseif e == "peripheral" or e == "peripheral_detach" then
-    applyState()
+local function heartbeatLoop()
+  while true do
+    sendStatus()
+    sleep(HEARTBEAT)
   end
-
-  if not relaunch then draw() end
 end
 
+local function jobLoop()
+  while true do
+    local ok, changed = pcall(stepJob)
+    if not ok then
+      log("Job error: " .. tostring(changed), colors.red)
+    elseif changed then
+      saveCfg(cfg)
+    end
+    applyState()
+    local inL, bufL = list(cfg.inputChest), list(cfg.bufferChest)
+    chestCounts.input = inL and countIn(inL) or "?"
+    chestCounts.buffer = bufL and countIn(bufL) or "?"
+    redraw()
+    sleep(TICK)
+  end
+end
+
+local function handle(m)
+  if m.type == "set" and m.on ~= cfg.on then
+    cfg.on = m.on; saveCfg(cfg); applyState(); sendStatus()
+    log("Fusebox switched line " .. (cfg.on and "ON" or "OFF"), colors.orange)
+
+  elseif m.type == "allow" then
+    cfg.allow, cfg.allowRev = m.allow, m.rev; saveCfg(cfg); sendStatus()
+    log("Allowed items updated", colors.orange)
+
+  elseif m.type == "job" then
+    local cur, new = cfg.job, m.job
+    if new == nil then
+      if cur then cfg.job = nil; saveCfg(cfg); log("Job #" .. cur.id .. " closed", colors.lightGray) end
+    elseif not cur or cur.id ~= new.id then
+      -- refuse inputs this line isn't allowed to take
+      local bad
+      for _, i in ipairs(new.inputs or {}) do
+        if not isAllowed(i.name) then bad = i.name end
+      end
+      new.inputs = new.inputs or {}
+      new.state, new.produced = "running", 0
+      if bad then new.state, new.warn = "done", "input not allowed: " .. bad end
+      cfg.job = new; saveCfg(cfg)
+      activity, lastInputTotal = os.clock(), -1
+      log("New job #" .. new.id .. (bad and " REFUSED (not allowed)" or ""), bad and colors.red or colors.lime)
+    else
+      -- same job: take over flags the fusebox may change later
+      cur.upstreamDone, cur.dest = new.upstreamDone, new.dest
+      saveCfg(cfg)
+    end
+    applyState(); sendStatus()
+
+  elseif m.type == "cancel" and cfg.job and cfg.job.id == m.id and cfg.job.state ~= "done" then
+    cfg.job.state = "cancel"; saveCfg(cfg); applyState(); sendStatus()
+  end
+end
+
+local function eventLoop()
+  draw()
+  while true do
+    local ev = { os.pullEvent() }
+    local e = ev[1]
+    if e == "rednet_message" and ev[4] == PROTO then
+      local m = ev[3]
+      if type(m) == "table" and m.name == cfg.name then handle(m) end
+    elseif e == "key" then
+      if ev[2] == keys.f9 then
+        if checkUpdate() then relaunch = true; return end
+      elseif ev[2] == keys.f2 then
+        cfg.reconfigure = true; saveCfg(cfg); relaunch = true; return
+      end
+    end
+    draw()
+  end
+end
+
+log("Line server started", colors.lightGray)
+applyState()
+parallel.waitForAny(eventLoop, heartbeatLoop, jobLoop)
 shell.run(shell.getRunningProgram())
