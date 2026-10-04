@@ -3,7 +3,7 @@
 -- Runs jobs given by the fusebox: fills the input chest from ME, runs the line,
 -- drains the buffer chest to ME or directly into the next line's input chest.
 
-local VERSION    = "2.0.3"
+local VERSION    = "2.1.0"
 local UPDATE_URL = "https://raw.githubusercontent.com/MechNoxer/CC-Tweaked-Scripts/main/Factory/line.lua"
 
 local PROTO     = "factory"
@@ -138,6 +138,31 @@ local function pickChests(c)
   c.bufferChest = pickChest("BUFFER chest (end of the line, finished items)", c.inputChest)
 end
 
+-- Some ME Bridge versions can't import from a networked chest. Fallback: push items
+-- into an ME Interface (or any inventory that feeds ME) with plain pushItems.
+local function pickMEInput(c)
+  local list = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    if not SIDES[n] and n ~= c.inputChest and n ~= c.bufferChest and peripheral.hasType(n, "inventory") then
+      list[#list + 1] = n
+    end
+  end
+  table.sort(list, function(a, b)
+    local ia, ib = a:find("interface") ~= nil, b:find("interface") ~= nil
+    if ia ~= ib then return ia end
+    return a < b
+  end)
+  print("ME INPUT for returning items to ME")
+  print("(an ME Interface with a wired modem works best):")
+  print("  0) none - use the ME Bridge only")
+  for i, n in ipairs(list) do print(("  %d) %s"):format(i, n)) end
+  local i
+  local def = (list[1] and list[1]:find("interface")) and "1" or "0"
+  repeat i = tonumber(ask("Choice", def)) until i and (i == 0 or list[i])
+  c.meInput = list[i]
+  c.meInputAsked = true
+end
+
 local cfg = loadCfg()
 if not cfg then
   term.clear(); term.setCursorPos(1, 1)
@@ -157,13 +182,18 @@ if cfg.reconfigure or not (cfg.inputChest and peripheral.isPresent(cfg.inputChes
   term.clear(); term.setCursorPos(1, 1)
   print("== Chest setup for line '" .. cfg.name .. "' ==")
   pickChests(cfg)
-  if cfg.reconfigure then pickClutch(cfg) end
+  if cfg.reconfigure then pickClutch(cfg); pickMEInput(cfg) end
   cfg.reconfigure = nil
   saveCfg(cfg)
 end
 if cfg.clutchSetup ~= 2 then
   term.clear(); term.setCursorPos(1, 1)
   pickClutch(cfg)
+  saveCfg(cfg)
+end
+if not cfg.meInputAsked then
+  term.clear(); term.setCursorPos(1, 1)
+  pickMEInput(cfg)
   saveCfg(cfg)
 end
 
@@ -277,13 +307,39 @@ local function export(name, count, target)
   return moved, err
 end
 
+-- push matching stacks from `source` into the ME input inventory (ME Interface)
+local function pushToME(name, count, source)
+  if not cfg.meInput then return 0, "no ME input set (F2 to set one)" end
+  local p = peripheral.wrap(source)
+  if not p then return 0, "chest " .. source .. " not found" end
+  local ok, l = pcall(p.list)
+  if not ok or type(l) ~= "table" then return 0, "can't read " .. source end
+  local moved = 0
+  for slot, it in pairs(l) do
+    if it.name == name and moved < count then
+      local ok2, n = pcall(p.pushItems, cfg.meInput, slot, count - moved)
+      if ok2 and type(n) == "number" then moved = moved + n end
+    end
+  end
+  if moved == 0 then return 0, cfg.meInput .. " accepted nothing (full/missing?)" end
+  return moved
+end
+
+local usePush = false   -- set once the bridge import has failed and the push worked
+
 local function import(name, count, source)
+  if usePush then return pushToME(name, count, source) end
   local moved, err = 0, nil
   while moved < count do
     local n
     n, err = bridgeMove("import", name, count - moved, source)
     if n <= 0 then break end
     moved = moved + n
+  end
+  if moved == 0 and cfg.meInput then
+    local m2, err2 = pushToME(name, count, source)
+    if m2 > 0 then usePush = true; return m2 end
+    return 0, tostring(err) .. " | push: " .. tostring(err2)
   end
   return moved, err
 end
@@ -535,6 +591,7 @@ local function draw()
   line("In:     ", cfg.inputChest .. "  (" .. chestCounts.input .. " items)", colors.lightGray)
   line("Buffer: ", cfg.bufferChest .. "  (" .. chestCounts.buffer .. " items)", colors.lightGray)
   line("Clutch: ", (cfg.clutchRelay or "computer") .. " / " .. cfg.clutchSide, colors.lightGray)
+  line("To ME:  ", usePush and ("push -> " .. cfg.meInput) or ("bridge" .. (cfg.meInput and (" (fallback " .. cfg.meInput .. ")") or "")), colors.lightGray)
 
   y = y + 1
   for _, l in ipairs(logLines) do
